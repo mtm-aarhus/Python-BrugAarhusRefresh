@@ -135,7 +135,3 @@ def main():
     # Print a JSON summary (handy for logs)
     summary = {"created": created, "failed": failed}
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-
-
-if __name__ == "__main__":
-    main()

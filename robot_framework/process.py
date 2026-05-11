@@ -264,7 +264,8 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     applications = cursor.fetchall()
 
     inserted_count = 0
-    skipped_existing = 0
+    updated_count = 0
+    skipped_locked = 0
     skipped_invalid = 0
 
     for row in applications:
@@ -312,10 +313,12 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             month_name = MONTH_NUM_TO_NAME[m]
             faktura_date_sort = datetime(y, m, 1)
 
-            # Skip if line already exists
+            # Check existing line + its lock state.
+            # - Ny: refresh updates base data so sagsbehandler sees the latest from Deskpro.
+            # - TilFakturering / Faktureret / FakturerIkke: locked, never touched.
             cursor.execute(
                 """
-                SELECT 1
+                SELECT FakturaStatus
                 FROM dbo.BrugAarhus_Udeservering_Fakturalinjer
                 WHERE DeskproID = ?
                   AND FakturaMaaned = ?
@@ -323,8 +326,46 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 """,
                 (deskpro_id, month_name, y),
             )
-            if cursor.fetchone():
-                skipped_existing += 1
+            existing = cursor.fetchone()
+
+            if existing:
+                if existing.FakturaStatus == "Ny":
+                    cursor.execute(
+                        """
+                        UPDATE dbo.BrugAarhus_Udeservering_Fakturalinjer
+                        SET Firmanavn       = ?,
+                            Adresse         = ?,
+                            CVR             = ?,
+                            Geo             = ?,
+                            Serveringszone  = ?,
+                            Lokation        = ?,
+                            Serveringsareal = ?,
+                            Facadelaengde   = ?,
+                            Periodetype     = ?,
+                            Ansogningsdato  = ?
+                        WHERE DeskproID    = ?
+                          AND FakturaMaaned = ?
+                          AND FakturaAar    = ?;
+                        """,
+                        (
+                            firmanavn,
+                            adresse,
+                            cvr,
+                            geo,
+                            serveringszone,
+                            lokation,
+                            faktura_areal,
+                            facadelaengde,
+                            periodetype,
+                            row.Ansogningsdato,
+                            deskpro_id,
+                            month_name,
+                            y,
+                        ),
+                    )
+                    updated_count += 1
+                else:
+                    skipped_locked += 1
                 continue
 
             cursor.execute(
@@ -372,7 +413,8 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     orchestrator_connection.log_info(
         "Fakturalinje generation complete. "
         f"Inserted: {inserted_count}, "
-        f"Skipped (existing): {skipped_existing}, "
+        f"Updated Ny: {updated_count}, "
+        f"Skipped (locked): {skipped_locked}, "
         f"Skipped (invalid): {skipped_invalid}"
     )
 

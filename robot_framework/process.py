@@ -4,7 +4,6 @@ from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConn
 from OpenOrchestrator.database.queues import QueueElement
 import requests
 import pyodbc
-import json
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
@@ -28,16 +27,13 @@ FIELD_FACADELAENGDE = "1210"       # Facadelængde i meter
 FIELD_WORKFLOW = "1147"
 
 # Periode
-# Deskpro has two end-date fields, but Kassen only stores one effective end-date
-# (in GaeldendeTilOgMed). Opsigelse trumps Gældende til og med if both are set.
-# Periodetype is kept for display/filtering only — doesn't affect billing logic.
+# - Gældende fra (1291): start.
+# - Gældende til og med (1292): planlagt slutdato (tidsbegrænset).
+# - Opsigelse (1318): vinder over 1292 hvis sat.
+# Begge slutdato-felter kollapses til én værdi i Kassen (GaeldendeTilOgMed).
 FIELD_GAELDENDE_FRA = "1291"
-FIELD_GAELDENDE_TIL_OG_MED = "1292"  # Planlagt slutdato (tidsbegrænset)
-FIELD_OPSIGELSE = "1318"             # Opsigelse — vinder over 1292 hvis sat
-FIELD_PERIODETYPE = "1311"           # Fortløbende (1312) / Tidsbegrænset (1313)
-
-OPT_PERIODE_FORTLOBENDE = 1312
-OPT_PERIODE_TIDSBEGRAENSET = 1313
+FIELD_GAELDENDE_TIL_OG_MED = "1292"
+FIELD_OPSIGELSE = "1318"
 
 # Lokation option ids
 OPT_LOKATION_FACADE = 1193
@@ -46,6 +42,12 @@ OPT_LOKATION_PARKLET = 1195
 
 # Fakturering
 FIELD_FAKTURERINGSSTATUS = "1228"  # Send til fakturering (1229) / Fakturer ikke (1230)
+
+
+# How many months ahead of "now" to generate fakturalinjer for when the
+# tilladelse is open-ended (no slutdato set on Deskpro). Past months are
+# always generated back to gaeldende_fra regardless of this number.
+MONTHS_AHEAD = 6
 
 
 MONTH_NUM_TO_NAME = {
@@ -65,8 +67,14 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     base_url = brugaarhus_api_cred.username
     token = brugaarhus_api_cred.password
 
-    # Filter: only tickets marked "Send til fakturering" (option 1229 of field 1228)
-    api_url = f"{base_url}/api/v2/tickets?ticket_field.{FIELD_FAKTURERINGSSTATUS}=1229&count=100"
+    # Filter: only tickets marked "Send til fakturering" (option 1229 of field 1228).
+    # include=person pulls the applicant in `linked.person` so we can store Att.
+    api_url = (
+        f"{base_url}/api/v2/tickets"
+        f"?ticket_field.{FIELD_FAKTURERINGSSTATUS}=1229"
+        f"&include=person"
+        f"&count=100"
+    )
     headers = {
         "Authorization": token,
         "Cookie": "dp_last_lang=da",
@@ -100,6 +108,18 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         data = payload.get("data", [])
         meta = payload.get("meta", {})
         pagination = meta.get("pagination", {})
+        linked = payload.get("linked", {}) if isinstance(payload.get("linked"), dict) else {}
+        person_map = linked.get("person", {}) if isinstance(linked.get("person"), dict) else {}
+
+        # Resolve each ticket's applicant name from the linked.person map and
+        # stamp it onto the ticket as `_att_name` for downstream use.
+        for ticket in data:
+            pid = ticket.get("person")
+            if pid is None:
+                continue
+            person = person_map.get(str(pid))
+            if isinstance(person, dict):
+                ticket["_att_name"] = person.get("name") or person.get("display_name")
 
         if not data:
             break
@@ -124,6 +144,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         adresse = safe_get_value(fields, FIELD_ADRESSE)
         cvr = safe_get_value(fields, FIELD_CVR)
         geo = safe_get_value(fields, FIELD_GEO)
+        att = ticket.get("_att_name")
 
         serveringszone = safe_get_first_detail_title(fields, FIELD_ZONE)
 
@@ -132,14 +153,6 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 
         facadelaengde = safe_get_value(fields, FIELD_FACADELAENGDE)
         serveringsareal = safe_get_value(fields, FIELD_SERVERINGSAREAL)
-
-        # Periode
-        periode_option_id = safe_get_single_select_id(fields, FIELD_PERIODETYPE)
-        periodetype = (
-            "Fortløbende" if periode_option_id == OPT_PERIODE_FORTLOBENDE
-            else "Tidsbegrænset" if periode_option_id == OPT_PERIODE_TIDSBEGRAENSET
-            else None
-        )
 
         gaeldende_fra = parse_deskpro_date(safe_get_value(fields, FIELD_GAELDENDE_FRA))
         planlagt_til = parse_deskpro_date(safe_get_value(fields, FIELD_GAELDENDE_TIL_OG_MED))
@@ -166,13 +179,13 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     ? AS Firmanavn,
                     ? AS Adresse,
                     ? AS CVR,
+                    ? AS Att,
                     ? AS Geo,
                     ? AS Serveringszone,
                     ? AS Lokation,
                     ? AS LokationOptionId,
                     ? AS Serveringsareal,
                     ? AS Facadelaengde,
-                    ? AS Periodetype,
                     ? AS GaeldendeFra,
                     ? AS GaeldendeTilOgMed,
                     ? AS Ansogningsdato
@@ -184,30 +197,29 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     Firmanavn = source.Firmanavn,
                     Adresse = source.Adresse,
                     CVR = source.CVR,
+                    Att = source.Att,
                     Geo = source.Geo,
                     Serveringszone = source.Serveringszone,
                     Lokation = source.Lokation,
                     LokationOptionId = source.LokationOptionId,
                     Serveringsareal = source.Serveringsareal,
                     Facadelaengde = source.Facadelaengde,
-                    Periodetype = source.Periodetype,
                     GaeldendeFra = source.GaeldendeFra,
                     GaeldendeTilOgMed = source.GaeldendeTilOgMed,
                     Ansogningsdato = source.Ansogningsdato
 
             WHEN NOT MATCHED THEN
                 INSERT (
-                    Id, Firmanavn, Adresse, CVR, Geo, Serveringszone, Lokation, LokationOptionId,
+                    Id, Firmanavn, Adresse, CVR, Att, Geo,
+                    Serveringszone, Lokation, LokationOptionId,
                     Serveringsareal, Facadelaengde,
-                    Periodetype,
                     GaeldendeFra, GaeldendeTilOgMed,
                     Ansogningsdato
                 )
                 VALUES (
-                    source.Id, source.Firmanavn, source.Adresse, source.CVR, source.Geo,
+                    source.Id, source.Firmanavn, source.Adresse, source.CVR, source.Att, source.Geo,
                     source.Serveringszone, source.Lokation, source.LokationOptionId,
                     source.Serveringsareal, source.Facadelaengde,
-                    source.Periodetype,
                     source.GaeldendeFra, source.GaeldendeTilOgMed,
                     source.Ansogningsdato
                 );
@@ -217,13 +229,13 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 firmanavn,
                 adresse,
                 cvr,
+                att,
                 geo,
                 serveringszone,
                 lokation_title,
                 lokation_option_id,
                 serveringsareal,
                 facadelaengde,
-                periodetype,
                 gaeldende_fra_sql,
                 gaeldende_til_sql,
                 ansogningsdato_sql,
@@ -237,8 +249,10 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     # Generate fakturalinjer
     # -------------------------------
     now_cph = datetime.now(ZoneInfo("Europe/Copenhagen"))
-    current_year = now_cph.year
-    current_month = now_cph.month
+
+    # Look-ahead horizon: current month + MONTHS_AHEAD - 1 future months,
+    # i.e. MONTHS_AHEAD months in total counting the current one.
+    horizon_year, horizon_month = add_months(now_cph.year, now_cph.month, MONTHS_AHEAD - 1)
 
     orchestrator_connection.log_info("Fetching application rows...")
     cursor.execute(
@@ -248,13 +262,13 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             Firmanavn,
             Adresse,
             CVR,
+            Att,
             Geo,
             Serveringszone,
             Lokation,
             LokationOptionId,
             Serveringsareal,
             Facadelaengde,
-            Periodetype,
             GaeldendeFra,
             GaeldendeTilOgMed,
             Ansogningsdato
@@ -274,6 +288,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         firmanavn = row.Firmanavn
         adresse = row.Adresse
         cvr = row.CVR
+        att = row.Att
         geo = row.Geo
         serveringszone = row.Serveringszone
         lokation = row.Lokation
@@ -284,24 +299,22 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 
         gaeldende_fra = ensure_date(row.GaeldendeFra)
         gaeldende_til = ensure_date(row.GaeldendeTilOgMed)
-        periodetype = row.Periodetype  # "Fortløbende" / "Tidsbegrænset" / None — display only
 
         if not gaeldende_fra:
             skipped_invalid += 1
             continue
 
-        # Generate invoice lines per month from gaeldende_fra to gaeldende_til.
-        # If no end-date set, run up to current month (+1 month if december => include januar).
+        # Generation window: from gaeldende_fra to min(gaeldende_til, horizon).
+        # - All past months back to gaeldende_fra are generated (handles retroactive billing).
+        # - Future months only up to MONTHS_AHEAD ahead.
+        # - A tidsbegrænset slutdato shortens the window further if it's closer.
         gen_from = (gaeldende_fra.year, gaeldende_fra.month)
+        gen_to = (horizon_year, horizon_month)
 
         if gaeldende_til:
-            gen_to = (gaeldende_til.year, gaeldende_til.month)
-        else:
-            # open-ended: up to current month (+ 1 ahead in december)
-            if current_month == 12:
-                gen_to = (current_year + 1, 1)
-            else:
-                gen_to = (current_year, current_month)
+            til_pair = (gaeldende_til.year, gaeldende_til.month)
+            if til_pair < gen_to:
+                gen_to = til_pair
 
         if gen_to < gen_from:
             continue
@@ -336,12 +349,12 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                         SET Firmanavn       = ?,
                             Adresse         = ?,
                             CVR             = ?,
+                            Att             = ?,
                             Geo             = ?,
                             Serveringszone  = ?,
                             Lokation        = ?,
                             Serveringsareal = ?,
                             Facadelaengde   = ?,
-                            Periodetype     = ?,
                             Ansogningsdato  = ?
                         WHERE DeskproID    = ?
                           AND FakturaMaaned = ?
@@ -351,12 +364,12 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                             firmanavn,
                             adresse,
                             cvr,
+                            att,
                             geo,
                             serveringszone,
                             lokation,
                             faktura_areal,
                             facadelaengde,
-                            periodetype,
                             row.Ansogningsdato,
                             deskpro_id,
                             month_name,
@@ -378,12 +391,12 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     Firmanavn,
                     Adresse,
                     CVR,
+                    Att,
                     Geo,
                     Serveringszone,
                     Lokation,
                     Serveringsareal,
                     Facadelaengde,
-                    Periodetype,
                     Ansogningsdato,
                     FakturaStatus
                 )
@@ -397,12 +410,12 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     firmanavn,
                     adresse,
                     cvr,
+                    att,
                     geo,
                     serveringszone,
                     lokation,
                     faktura_areal,
                     facadelaengde,
-                    periodetype,
                     row.Ansogningsdato,
                 ),
             )
@@ -425,6 +438,12 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 # -----------------------------
 # HELPERS
 # -----------------------------
+def add_months(year: int, month: int, delta: int) -> tuple[int, int]:
+    """Return (year, month) `delta` months after the given (year, month)."""
+    idx = (year * 12 + (month - 1)) + delta
+    return (idx // 12, idx % 12 + 1)
+
+
 def iter_year_months(start: tuple[int, int], end: tuple[int, int]):
     """Yield (year, month) tuples from start to end inclusive."""
     y, m = start

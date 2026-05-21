@@ -8,47 +8,73 @@ from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
 
-# -----------------------------
+# =============================================================================
 # DESKPRO FIELD IDS
-# -----------------------------
-# Stam-data
+# Always use IDs — Deskpro titles get renamed during prototyping.
+# =============================================================================
 FIELD_FIRMANAVN = "55"             # Cafeens / restaurantens navn
 FIELD_ADRESSE = "255"              # Cafeens / restaurantens adresse
-FIELD_CVR = "1258"                 # CVR Nummer (TEST Udeservering/Vareudstilling)
 FIELD_GEO = "268"                  # Cafeens / restaurantens adresse (geo)
+FIELD_CVR = "1258"                 # TEST Udeservering/Vareudstilling — CVR (number)
 
 # Sagsdata
-FIELD_ZONE = "1216"                # Zone (single select)
-FIELD_LOKATION = "1192"            # Hvor ønskes udeservering? (single select)
-FIELD_SERVERINGSAREAL = "1196"     # Areal i m²
-FIELD_FACADELAENGDE = "1210"       # Facadelængde i meter
-
-# Workflow / styring
-FIELD_WORKFLOW = "1147"
+FIELD_ZONE = "1216"                # TEST Udeservering — Zone (1 / 2)
+FIELD_LOKATION = "1192"            # TEST Udeservering — Hvor ønskes udeservering?
+FIELD_SERVERINGSAREAL = "1196"
+FIELD_FACADELAENGDE = "1210"
 
 # Periode
-# - Gældende fra (1291): start.
-# - Gældende til og med (1292): planlagt slutdato (tidsbegrænset).
-# - Opsigelse (1318): vinder over 1292 hvis sat.
-# Begge slutdato-felter kollapses til én værdi i Kassen (GaeldendeTilOgMed).
 FIELD_GAELDENDE_FRA = "1291"
 FIELD_GAELDENDE_TIL_OG_MED = "1292"
-FIELD_OPSIGELSE = "1318"
+FIELD_OPSIGELSE = "1318"           # Slutdato hvis tilladelse opsiges; vinder over 1292
 
-# Lokation option ids
-OPT_LOKATION_FACADE = 1193
-OPT_LOKATION_TORV = 1194
-OPT_LOKATION_PARKLET = 1195
+# Sæson — drives which months a tilladelse actually gets billed in
+FIELD_SOMMERSAESON = "64"          # Radio: Ja (65) → bill all 6 summer months
+FIELD_VINTERSAESON = "67"          # Checkbox multi: each selected month is billable
 
-# Fakturering
-FIELD_FAKTURERINGSSTATUS = "1228"  # Send til fakturering (1229) / Fakturer ikke (1230)
+# Fakturering trigger from Deskpro side
+FIELD_FAKTURERINGSSTATUS = "1228"  # Send (1229) / Send ikke (1230)
 
 
-# How many months ahead of "now" to generate fakturalinjer for when the
-# tilladelse is open-ended (no slutdato set on Deskpro). Past months are
-# always generated back to gaeldende_fra regardless of this number.
+# =============================================================================
+# OPTION IDS
+# =============================================================================
+# Lokation (field 1192)
+OPT_LOKATION_FACADE = 1193     # "Facade og nærliggende areal"
+OPT_LOKATION_TORV = 1194       # "Nærliggende torv/plads"
+OPT_LOKATION_PARKLET = 1195    # "Parklet"
+
+# Sommersæson Ja → all six months of April through September
+OPT_SOMMER_JA = 65
+OPT_SOMMER_NEJ = 66
+SUMMER_MONTHS = (4, 5, 6, 7, 8, 9)
+
+# Vintersæson option → month number. The option-id order (68→73) is the
+# natural Danish winter-season order (Oktober → Marts).
+WINTER_OPT_TO_MONTH = {
+    68: 10,  # Oktober
+    69: 11,  # November
+    70: 12,  # December
+    71: 1,   # Januar
+    72: 2,   # Februar
+    73: 3,   # Marts
+}
+WINTER_OPT_TO_NAME = {
+    68: "Oktober",
+    69: "November",
+    70: "December",
+    71: "Januar",
+    72: "Februar",
+    73: "Marts",
+}
+
+OPT_FAKTURERING_SEND = 1229
+
+
+# How many months ahead of "now" we generate fakturalinjer for when the
+# tilladelse is open-ended (no slutdato set). Past months are always
+# back-filled to gaeldende_fra regardless.
 MONTHS_AHEAD = 6
-
 
 MONTH_NUM_TO_NAME = {
     1: "Januar", 2: "Februar", 3: "Marts", 4: "April",
@@ -57,9 +83,9 @@ MONTH_NUM_TO_NAME = {
 }
 
 
-# -----------------------------
+# =============================================================================
 # PROCESS
-# -----------------------------
+# =============================================================================
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
     orchestrator_connection.log_trace("Running process.")
 
@@ -67,11 +93,11 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     base_url = brugaarhus_api_cred.username
     token = brugaarhus_api_cred.password
 
-    # Filter: only tickets marked "Send til fakturering" (option 1229 of field 1228).
-    # include=person pulls the applicant in `linked.person` so we can store Att.
+    # Only fetch tickets explicitly marked "Send til fakturering".
+    # include=person → linked.person.<id>.name resolves to the Att applicant name.
     api_url = (
         f"{base_url}/api/v2/tickets"
-        f"?ticket_field.{FIELD_FAKTURERINGSSTATUS}=1229"
+        f"?ticket_field.{FIELD_FAKTURERINGSSTATUS}={OPT_FAKTURERING_SEND}"
         f"&include=person"
         f"&count=100"
     )
@@ -92,7 +118,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     cursor = conn.cursor()
 
     # -------------------------------
-    # Fetch all pages of API data
+    # Fetch all pages, stamping each ticket with its applicant name.
     # -------------------------------
     all_data: list[dict] = []
     page = 1
@@ -111,8 +137,6 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         linked = payload.get("linked", {}) if isinstance(payload.get("linked"), dict) else {}
         person_map = linked.get("person", {}) if isinstance(linked.get("person"), dict) else {}
 
-        # Resolve each ticket's applicant name from the linked.person map and
-        # stamp it onto the ticket as `_att_name` for downstream use.
         for ticket in data:
             pid = ticket.get("person")
             if pid is None:
@@ -123,9 +147,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 
         if not data:
             break
-
         all_data.extend(data)
-
         if pagination.get("current_page", 1) >= pagination.get("total_pages", 1):
             break
         page += 1
@@ -133,8 +155,19 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     orchestrator_connection.log_info(f"Fetched {len(all_data)} tickets from API.")
 
     # -------------------------------
-    # Upsert applications into dbo.BrugAarhus_Udeservering
+    # Single loop: per ticket, upsert the Udeservering row AND drive the
+    # fakturalinje generation. The sæson selection lives only in Deskpro —
+    # we recompute it every refresh, no need to persist it in our DB.
     # -------------------------------
+    now_cph = datetime.now(ZoneInfo("Europe/Copenhagen"))
+    horizon_year, horizon_month = add_months(now_cph.year, now_cph.month, MONTHS_AHEAD - 1)
+
+    inserted_count = 0
+    updated_count = 0
+    deleted_count = 0
+    skipped_locked = 0
+    skipped_invalid = 0
+
     for ticket in all_data:
         fields = ticket.get("fields", {}) or {}
 
@@ -157,12 +190,20 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         gaeldende_fra = parse_deskpro_date(safe_get_value(fields, FIELD_GAELDENDE_FRA))
         planlagt_til = parse_deskpro_date(safe_get_value(fields, FIELD_GAELDENDE_TIL_OG_MED))
         opsigelse = parse_deskpro_date(safe_get_value(fields, FIELD_OPSIGELSE))
-
-        # Collapse the two Deskpro end-dates into one effective end-date for Kassen.
-        # Opsigelse wins over planlagt slutdato.
         effective_til = opsigelse or planlagt_til
 
-        # Ticket created
+        # Sæson billable-month set — computed fresh from the ticket every run.
+        # If nothing is selected (neither Sommer=Ja nor any winter month), the
+        # set is empty and *no* fakturalinjer will be generated for this
+        # tilladelse. Any existing Ny rows in the window are deleted as
+        # out-of-sæson. Kassen surfaces this state with a red warning so the
+        # sagsbehandler knows to fix the tilladelse in Deskpro.
+        billable_months = compute_billable_months(fields)
+
+        # Display-only mirrors persisted to BrugAarhus_Udeservering.
+        sommersaeson_text, vintermaaneder_text = compute_saeson_text(fields)
+
+        # Ticket created → Ansøgningsdato
         raw_created = ticket.get("date_created")
         ansogningsdato = parse_deskpro_dt(raw_created)
 
@@ -170,6 +211,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         gaeldende_fra_sql = gaeldende_fra.strftime("%Y-%m-%d") if gaeldende_fra else None
         gaeldende_til_sql = effective_til.strftime("%Y-%m-%d") if effective_til else None
 
+        # -------- Upsert Udeservering --------
         cursor.execute(
             """
             MERGE [dbo].[BrugAarhus_Udeservering] AS target
@@ -188,25 +230,29 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     ? AS Facadelaengde,
                     ? AS GaeldendeFra,
                     ? AS GaeldendeTilOgMed,
+                    ? AS Sommersaeson,
+                    ? AS Vintermaaneder,
                     ? AS Ansogningsdato
             ) AS source
             ON (target.Id = source.Id)
 
             WHEN MATCHED THEN
                 UPDATE SET
-                    Firmanavn = source.Firmanavn,
-                    Adresse = source.Adresse,
-                    CVR = source.CVR,
-                    Att = source.Att,
-                    Geo = source.Geo,
-                    Serveringszone = source.Serveringszone,
-                    Lokation = source.Lokation,
-                    LokationOptionId = source.LokationOptionId,
-                    Serveringsareal = source.Serveringsareal,
-                    Facadelaengde = source.Facadelaengde,
-                    GaeldendeFra = source.GaeldendeFra,
+                    Firmanavn         = source.Firmanavn,
+                    Adresse           = source.Adresse,
+                    CVR               = source.CVR,
+                    Att               = source.Att,
+                    Geo               = source.Geo,
+                    Serveringszone    = source.Serveringszone,
+                    Lokation          = source.Lokation,
+                    LokationOptionId  = source.LokationOptionId,
+                    Serveringsareal   = source.Serveringsareal,
+                    Facadelaengde     = source.Facadelaengde,
+                    GaeldendeFra      = source.GaeldendeFra,
                     GaeldendeTilOgMed = source.GaeldendeTilOgMed,
-                    Ansogningsdato = source.Ansogningsdato
+                    Sommersaeson      = source.Sommersaeson,
+                    Vintermaaneder    = source.Vintermaaneder,
+                    Ansogningsdato    = source.Ansogningsdato
 
             WHEN NOT MATCHED THEN
                 INSERT (
@@ -214,6 +260,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     Serveringszone, Lokation, LokationOptionId,
                     Serveringsareal, Facadelaengde,
                     GaeldendeFra, GaeldendeTilOgMed,
+                    Sommersaeson, Vintermaaneder,
                     Ansogningsdato
                 )
                 VALUES (
@@ -221,6 +268,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     source.Serveringszone, source.Lokation, source.LokationOptionId,
                     source.Serveringsareal, source.Facadelaengde,
                     source.GaeldendeFra, source.GaeldendeTilOgMed,
+                    source.Sommersaeson, source.Vintermaaneder,
                     source.Ansogningsdato
                 );
             """,
@@ -238,97 +286,33 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 facadelaengde,
                 gaeldende_fra_sql,
                 gaeldende_til_sql,
+                sommersaeson_text,
+                vintermaaneder_text,
                 ansogningsdato_sql,
             ),
         )
 
-    conn.commit()
-    orchestrator_connection.log_info("Application upsert complete.")
-
-    # -------------------------------
-    # Generate fakturalinjer
-    # -------------------------------
-    now_cph = datetime.now(ZoneInfo("Europe/Copenhagen"))
-
-    # Look-ahead horizon: current month + MONTHS_AHEAD - 1 future months,
-    # i.e. MONTHS_AHEAD months in total counting the current one.
-    horizon_year, horizon_month = add_months(now_cph.year, now_cph.month, MONTHS_AHEAD - 1)
-
-    orchestrator_connection.log_info("Fetching application rows...")
-    cursor.execute(
-        """
-        SELECT
-            Id AS DeskproID,
-            Firmanavn,
-            Adresse,
-            CVR,
-            Att,
-            Geo,
-            Serveringszone,
-            Lokation,
-            LokationOptionId,
-            Serveringsareal,
-            Facadelaengde,
-            GaeldendeFra,
-            GaeldendeTilOgMed,
-            Ansogningsdato
-        FROM dbo.BrugAarhus_Udeservering;
-        """
-    )
-    applications = cursor.fetchall()
-
-    inserted_count = 0
-    updated_count = 0
-    skipped_locked = 0
-    skipped_invalid = 0
-
-    for row in applications:
-        deskpro_id = row.DeskproID
-
-        firmanavn = row.Firmanavn
-        adresse = row.Adresse
-        cvr = row.CVR
-        att = row.Att
-        geo = row.Geo
-        serveringszone = row.Serveringszone
-        lokation = row.Lokation
-        lokation_option_id = row.LokationOptionId
-
-        base_areal = row.Serveringsareal
-        facadelaengde = row.Facadelaengde
-
-        gaeldende_fra = ensure_date(row.GaeldendeFra)
-        gaeldende_til = ensure_date(row.GaeldendeTilOgMed)
-
+        # -------- Generate / refresh fakturalinjer for this tilladelse --------
         if not gaeldende_fra:
             skipped_invalid += 1
             continue
 
-        # Generation window: from gaeldende_fra to min(gaeldende_til, horizon).
-        # - All past months back to gaeldende_fra are generated (handles retroactive billing).
-        # - Future months only up to MONTHS_AHEAD ahead.
-        # - A tidsbegrænset slutdato shortens the window further if it's closer.
         gen_from = (gaeldende_fra.year, gaeldende_fra.month)
         gen_to = (horizon_year, horizon_month)
-
-        if gaeldende_til:
-            til_pair = (gaeldende_til.year, gaeldende_til.month)
+        if effective_til:
+            til_pair = (effective_til.year, effective_til.month)
             if til_pair < gen_to:
                 gen_to = til_pair
-
         if gen_to < gen_from:
             continue
 
-        # Areal: parklet has no areal (charged differently). Else use base_areal.
-        faktura_areal = None if lokation_option_id == OPT_LOKATION_PARKLET else base_areal
+        # Parklet has no areal — charged differently.
+        faktura_areal = None if lokation_option_id == OPT_LOKATION_PARKLET else serveringsareal
 
         for (y, m) in iter_year_months(gen_from, gen_to):
             month_name = MONTH_NUM_TO_NAME[m]
             faktura_date_sort = datetime(y, m, 1)
 
-            # Check existing line + its lock state.
-            # - Ny: refresh updates base data so sagsbehandler sees the latest from Deskpro.
-            # - TilFakturering / Faktureret / FakturerIkke: locked, never touched.
             cursor.execute(
                 """
                 SELECT FakturaStatus
@@ -340,6 +324,25 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 (deskpro_id, month_name, y),
             )
             existing = cursor.fetchone()
+
+            # Month not in current sæson selection: drop any Ny line; leave
+            # locked statuses (TilFakturering / Faktureret / FakturerIkke) alone.
+            if m not in billable_months:
+                if existing and existing.FakturaStatus == "Ny":
+                    cursor.execute(
+                        """
+                        DELETE FROM dbo.BrugAarhus_Udeservering_Fakturalinjer
+                        WHERE DeskproID = ?
+                          AND FakturaMaaned = ?
+                          AND FakturaAar = ?
+                          AND FakturaStatus = 'Ny';
+                        """,
+                        (deskpro_id, month_name, y),
+                    )
+                    deleted_count += 1
+                elif existing:
+                    skipped_locked += 1
+                continue
 
             if existing:
                 if existing.FakturaStatus == "Ny":
@@ -367,10 +370,10 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                             att,
                             geo,
                             serveringszone,
-                            lokation,
+                            lokation_title,
                             faktura_areal,
                             facadelaengde,
-                            row.Ansogningsdato,
+                            ansogningsdato_sql,
                             deskpro_id,
                             month_name,
                             y,
@@ -413,10 +416,10 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     att,
                     geo,
                     serveringszone,
-                    lokation,
+                    lokation_title,
                     faktura_areal,
                     facadelaengde,
-                    row.Ansogningsdato,
+                    ansogningsdato_sql,
                 ),
             )
             inserted_count += 1
@@ -424,9 +427,10 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     conn.commit()
 
     orchestrator_connection.log_info(
-        "Fakturalinje generation complete. "
+        "Refresh complete. "
         f"Inserted: {inserted_count}, "
         f"Updated Ny: {updated_count}, "
+        f"Deleted (out-of-sæson Ny): {deleted_count}, "
         f"Skipped (locked): {skipped_locked}, "
         f"Skipped (invalid): {skipped_invalid}"
     )
@@ -435,17 +439,53 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     conn.close()
 
 
-# -----------------------------
+# =============================================================================
 # HELPERS
-# -----------------------------
+# =============================================================================
+def compute_billable_months(fields: dict) -> set[int]:
+    """Union of Sommersæson + Vintersæson selections from Deskpro,
+    as a set of integer month numbers (1–12).
+    Returns empty set if neither field has any selection (caller treats
+    this as legacy / unanswered and falls back to all 12 months)."""
+    sommer_ids = safe_get_multi_select_ids(fields, FIELD_SOMMERSAESON)
+    vinter_ids = safe_get_multi_select_ids(fields, FIELD_VINTERSAESON)
+
+    months: set[int] = set()
+    if OPT_SOMMER_JA in sommer_ids:
+        months.update(SUMMER_MONTHS)
+    months.update(WINTER_OPT_TO_MONTH[oid] for oid in vinter_ids if oid in WINTER_OPT_TO_MONTH)
+    return months
+
+
+def compute_saeson_text(fields: dict) -> tuple[str | None, str | None]:
+    """Return human-readable mirrors of the Sommer/Vinter selections so
+    Kassen can show them on the tilladelse without re-reading Deskpro.
+
+    Sommersaeson    : "Ja" / "Nej" / None (unanswered)
+    Vintermaaneder  : "Oktober, November, December" / None (none selected)
+    """
+    sommer_ids = safe_get_multi_select_ids(fields, FIELD_SOMMERSAESON)
+    if OPT_SOMMER_JA in sommer_ids:
+        sommer_text = "Ja"
+    elif OPT_SOMMER_NEJ in sommer_ids:
+        sommer_text = "Nej"
+    else:
+        sommer_text = None
+
+    vinter_ids = safe_get_multi_select_ids(fields, FIELD_VINTERSAESON)
+    # Sort by option-id so months come out in Okt→Nov→Dec→Jan→Feb→Marts order.
+    winter_names = [WINTER_OPT_TO_NAME[oid] for oid in sorted(vinter_ids) if oid in WINTER_OPT_TO_NAME]
+    vinter_text = ", ".join(winter_names) if winter_names else None
+
+    return sommer_text, vinter_text
+
+
 def add_months(year: int, month: int, delta: int) -> tuple[int, int]:
-    """Return (year, month) `delta` months after the given (year, month)."""
     idx = (year * 12 + (month - 1)) + delta
     return (idx // 12, idx % 12 + 1)
 
 
 def iter_year_months(start: tuple[int, int], end: tuple[int, int]):
-    """Yield (year, month) tuples from start to end inclusive."""
     y, m = start
     ey, em = end
     while (y, m) <= (ey, em):
@@ -457,7 +497,6 @@ def iter_year_months(start: tuple[int, int], end: tuple[int, int]):
 
 
 def safe_get_value(field_dict: dict, key: str, default=None):
-    """Safely get field_dict[key]['value']."""
     try:
         return field_dict[key].get("value", default)
     except Exception:
@@ -465,7 +504,6 @@ def safe_get_value(field_dict: dict, key: str, default=None):
 
 
 def safe_get_first_detail_title(field_dict: dict, key: str, default=None):
-    """Return first title in .detail (dict style) if exists."""
     try:
         detail = field_dict[key].get("detail", {})
         if isinstance(detail, dict) and detail:
@@ -476,7 +514,6 @@ def safe_get_first_detail_title(field_dict: dict, key: str, default=None):
 
 
 def safe_get_single_select_id(field_dict: dict, key: str, default=None):
-    """Return selected option id for single select fields where value is [id]."""
     try:
         v = field_dict[key].get("value")
         if isinstance(v, list) and v:
@@ -486,8 +523,21 @@ def safe_get_single_select_id(field_dict: dict, key: str, default=None):
     return default
 
 
+def safe_get_multi_select_ids(field_dict: dict, key: str) -> list[int]:
+    """Selected option IDs for radio/checkbox/multichoice fields.
+    Handles both single (value = [id]) and multi (value = [id, id, …])."""
+    try:
+        v = field_dict[key].get("value")
+        if isinstance(v, list):
+            return [int(x) for x in v if isinstance(x, int) or (isinstance(x, str) and str(x).isdigit())]
+        if isinstance(v, (int, str)) and str(v).strip().isdigit():
+            return [int(v)]
+    except Exception:
+        pass
+    return []
+
+
 def parse_deskpro_dt(raw: str | None) -> datetime | None:
-    """Parse Deskpro datetime '2026-01-20T09:04:45+0000' -> naive Copenhagen datetime."""
     if not raw:
         return None
     try:
@@ -499,7 +549,6 @@ def parse_deskpro_dt(raw: str | None) -> datetime | None:
 
 
 def parse_deskpro_date(raw: str | None) -> date | None:
-    """Parse Deskpro date fields: 'YYYY-MM-DD' OR datetime-like 'YYYY-MM-DDT00:00:00+0000'."""
     if not raw:
         return None
     try:

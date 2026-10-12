@@ -52,6 +52,11 @@ TYPE_FALLBACK_TITLE = {
 
 OPT_WORKFLOW_GODKENDT = 1151   # "Ansøgning godkendt" → the tilladelse enters kassen
 
+# Kassen's own approval of a tilladelse (dobbelttjek): Afventer → Godkendt /
+# Afvist. Set by sagsbehandlere in kassen; the refresh only reads it.
+# Fakturalinjer are only generated once the tilladelse is "Godkendt".
+KASSEN_GODKENDT = "Godkendt"
+
 # Sommersæson Ja → all six months of April through September
 OPT_SOMMER_JA = 65
 OPT_SOMMER_NEJ = 66
@@ -159,12 +164,16 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     now_cph = datetime.now(ZoneInfo("Europe/Copenhagen"))
     horizon = add_months(now_cph.year, now_cph.month, MONTHS_AHEAD - 1)
 
+    # New tilladelser aren't in this dict; they're inserted as "Afventer".
+    kassen_status = load_kassen_status(cursor)
+
     inserted_count = 0
     updated_count = 0
     deleted_count = 0
     skipped_locked = 0
     skipped_invalid = 0
     special_count = 0
+    afventer_count = 0
 
     for ticket in all_data:
         fields = ticket.get("fields", {}) or {}
@@ -301,7 +310,15 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             skipped_invalid += 1
             continue
 
-        wanted = billable_year_months(startdato, slutdato, horizon, billable_months)
+        # Lines only once kassen has approved the tilladelse (dobbelttjek).
+        # Until then — or after it's set back to Afventer, or Afvist — any Ny
+        # lines are removed below.
+        if kassen_status.get(deskpro_id) == KASSEN_GODKENDT:
+            wanted = billable_year_months(startdato, slutdato, horizon, billable_months)
+        else:
+            wanted = []
+            if type_id != OPT_TYPE_SPECIAL:
+                afventer_count += 1
 
         # Existing lines for this tilladelse, keyed by (year, month).
         cursor.execute(
@@ -422,7 +439,8 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         f"Deleted (no longer billable Ny): {deleted_count}, "
         f"Skipped (locked): {skipped_locked}, "
         f"Skipped (no startdato): {skipped_invalid}, "
-        f"Specialtilladelser (no lines): {special_count}"
+        f"Specialtilladelser (no lines): {special_count}, "
+        f"Not approved in kassen (no lines): {afventer_count}"
     )
 
     cursor.close()
@@ -494,6 +512,12 @@ def fetch_ticket(orchestrator_connection, base_url: str, headers: dict, ticket_i
         return None
     _stamp_att([ticket], payload)
     return ticket
+
+
+def load_kassen_status(cursor) -> dict[int, str]:
+    """KassenStatus per tilladelse already in kassen, as set by sagsbehandlere."""
+    cursor.execute("SELECT Id, KassenStatus FROM dbo.BrugAarhus_Udeservering;")
+    return {int(r.Id): r.KassenStatus for r in cursor.fetchall()}
 
 
 def kassen_ids_to_follow(cursor) -> list[int]:

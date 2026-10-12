@@ -1,4 +1,11 @@
-"""This module contains the main process of the robot."""
+"""This module contains the main process of the robot.
+
+The robot syncs udeservering tilladelser from Deskpro into
+BrugAarhus_Udeservering — nothing else. The fakturalinjer are BrugAarhus
+Kassen's job: after the sync the robot asks kassen to bring the lines of the
+synced tilladelser up to date (POST /udeservering/api/fakturalinjer/dan), which
+keeps the rolling horizon moving and picks up changes from Deskpro.
+"""
 
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
 from OpenOrchestrator.database.queues import QueueElement
@@ -28,13 +35,17 @@ FIELD_FACADELAENGDE = "1210"       # the form shows it for Alm. udeservering
 FIELD_STARTDATO = "1291"
 FIELD_SLUTDATO = "1292"
 
-# Sæson — drives which months a tilladelse actually gets billed in. Which
-# types show which season field is decided by the Deskpro form, not here.
-FIELD_SOMMERSAESON = "64"          # Radio: Ja (65) → all six summer months
-FIELD_VINTERSAESON = "67"          # Checkbox multi: each selected month is billable
+# Sæson — kassen bills from the mirrors stored below (Sommersaeson "Ja",
+# Vintermaaneder "Oktober, November"). Which types show which season field is
+# decided by the Deskpro form.
+FIELD_SOMMERSAESON = "64"          # Radio: Ja (65) / Nej (66)
+FIELD_VINTERSAESON = "67"          # Checkbox multi: the winter months
 
 # Deskpro department of the udeservering form ("TEST - Udeservering").
 DEPARTMENT_ID = 23
+
+# How many tilladelser per call to kassen's fakturalinje API (max 500).
+KASSEN_CHUNK = 100
 
 
 # =============================================================================
@@ -52,26 +63,11 @@ TYPE_FALLBACK_TITLE = {
 
 OPT_WORKFLOW_GODKENDT = 1151   # "Ansøgning godkendt" → the tilladelse enters kassen
 
-# Kassen's own approval of a tilladelse (dobbelttjek): Afventer → Godkendt /
-# Afvist. Set by sagsbehandlere in kassen; the refresh only reads it.
-# Fakturalinjer are only generated once the tilladelse is "Godkendt".
-KASSEN_GODKENDT = "Godkendt"
-
-# Sommersæson Ja → all six months of April through September
 OPT_SOMMER_JA = 65
 OPT_SOMMER_NEJ = 66
-SUMMER_MONTHS = (4, 5, 6, 7, 8, 9)
 
-# Vintersæson option → month number. The option-id order (68→73) is the
-# natural Danish winter-season order (Oktober → Marts).
-WINTER_OPT_TO_MONTH = {
-    68: 10,  # Oktober
-    69: 11,  # November
-    70: 12,  # December
-    71: 1,   # Januar
-    72: 2,   # Februar
-    73: 3,   # Marts
-}
+# Vintersæson option → month name. The option-id order (68→73) is the natural
+# Danish winter-season order (Oktober → Marts).
 WINTER_OPT_TO_NAME = {
     68: "Oktober",
     69: "November",
@@ -80,19 +76,6 @@ WINTER_OPT_TO_NAME = {
     72: "Februar",
     73: "Marts",
 }
-
-
-# How many months ahead of "now" we generate fakturalinjer for when the
-# tilladelse is open-ended (no slutdato set). Past months are always
-# back-filled to the startdato regardless.
-MONTHS_AHEAD = 6
-
-MONTH_NUM_TO_NAME = {
-    1: "Januar", 2: "Februar", 3: "Marts", 4: "April",
-    5: "Maj", 6: "Juni", 7: "Juli", 8: "August",
-    9: "September", 10: "Oktober", 11: "November", 12: "December",
-}
-MONTH_NAME_TO_NUM = {v: k for k, v in MONTH_NUM_TO_NAME.items()}
 
 
 # =============================================================================
@@ -157,294 +140,167 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     )
 
     # -------------------------------
-    # Single loop: per ticket, upsert the Udeservering row AND drive the
-    # fakturalinje generation. The sæson selection lives only in Deskpro —
-    # we recompute it every refresh.
+    # Upsert every tilladelse. New rows get KassenStatus "Afventer" from the
+    # column default; kassen's own approval is never overwritten here.
     # -------------------------------
-    now_cph = datetime.now(ZoneInfo("Europe/Copenhagen"))
-    horizon = add_months(now_cph.year, now_cph.month, MONTHS_AHEAD - 1)
-
-    # New tilladelser aren't in this dict; they're inserted as "Afventer".
-    kassen_status = load_kassen_status(cursor)
-
-    inserted_count = 0
-    updated_count = 0
-    deleted_count = 0
-    skipped_locked = 0
-    skipped_invalid = 0
-    special_count = 0
-    afventer_count = 0
-
     for ticket in all_data:
-        fields = ticket.get("fields", {}) or {}
-
-        deskpro_id = ticket.get("id")
-
-        firmanavn = safe_get_value(fields, FIELD_FIRMANAVN)
-        adresse = safe_get_value(fields, FIELD_ADRESSE)
-        cvr = safe_get_value(fields, FIELD_CVR)
-        att = ticket.get("_att_name")
-
-        serveringszone = safe_get_first_detail_title(fields, FIELD_ZONE)
-
-        type_id = get_type_id(fields)
-        type_title = safe_get_first_detail_title(fields, FIELD_UDESERVERINGSTYPE) or TYPE_FALLBACK_TITLE[type_id]
-
-        # Mirrored so kassen can warn when a tilladelse it still bills has left
-        # "Ansøgning godkendt" in Deskpro. Billing itself ignores it.
-        workflow_id = safe_get_single_select_id(fields, FIELD_WORKFLOW)
-        workflow_title = safe_get_first_detail_title(fields, FIELD_WORKFLOW)
-
-        serveringsareal = safe_get_value(fields, FIELD_SERVERINGSAREAL)
-        facadelaengde = safe_get_value(fields, FIELD_FACADELAENGDE)
-
-        startdato = parse_deskpro_date(safe_get_value(fields, FIELD_STARTDATO))
-        slutdato = parse_deskpro_date(safe_get_value(fields, FIELD_SLUTDATO))
-
-        # Sæson billable-month set — computed fresh from the ticket every run.
-        # Empty set (nothing selected, or a specialtilladelse) means *no*
-        # fakturalinjer. Kassen surfaces "mangler sæson" with a red warning.
-        billable_months = compute_billable_months(type_id, fields)
-
-        # Display-only mirrors persisted to BrugAarhus_Udeservering.
-        sommersaeson_text, vintermaaneder_text = compute_saeson_text(type_id, fields)
-
-        # Ticket created → Ansøgningsdato
-        ansogningsdato = parse_deskpro_dt(ticket.get("date_created"))
-
-        ansogningsdato_sql = ansogningsdato.strftime("%Y-%m-%d %H:%M:%S") if ansogningsdato else None
-        gaeldende_fra_sql = startdato.strftime("%Y-%m-%d") if startdato else None
-        gaeldende_til_sql = slutdato.strftime("%Y-%m-%d") if slutdato else None
-
-        # -------- Upsert Udeservering --------
-        cursor.execute(
-            """
-            MERGE [dbo].[BrugAarhus_Udeservering] AS target
-            USING (
-                SELECT
-                    ? AS Id,
-                    ? AS Firmanavn,
-                    ? AS Adresse,
-                    ? AS CVR,
-                    ? AS Att,
-                    ? AS Serveringszone,
-                    ? AS Udeserveringstype,
-                    ? AS UdeserveringstypeOptionId,
-                    ? AS Serveringsareal,
-                    ? AS Facadelaengde,
-                    ? AS GaeldendeFra,
-                    ? AS GaeldendeTilOgMed,
-                    ? AS Sommersaeson,
-                    ? AS Vintermaaneder,
-                    ? AS Workflow,
-                    ? AS WorkflowOptionId,
-                    ? AS Ansogningsdato
-            ) AS source
-            ON (target.Id = source.Id)
-
-            WHEN MATCHED THEN
-                UPDATE SET
-                    Firmanavn                 = source.Firmanavn,
-                    Adresse                   = source.Adresse,
-                    CVR                       = source.CVR,
-                    Att                       = source.Att,
-                    Serveringszone            = source.Serveringszone,
-                    Udeserveringstype         = source.Udeserveringstype,
-                    UdeserveringstypeOptionId = source.UdeserveringstypeOptionId,
-                    Serveringsareal           = source.Serveringsareal,
-                    Facadelaengde             = source.Facadelaengde,
-                    GaeldendeFra              = source.GaeldendeFra,
-                    GaeldendeTilOgMed         = source.GaeldendeTilOgMed,
-                    Sommersaeson              = source.Sommersaeson,
-                    Vintermaaneder            = source.Vintermaaneder,
-                    Workflow                  = source.Workflow,
-                    WorkflowOptionId          = source.WorkflowOptionId,
-                    Ansogningsdato            = source.Ansogningsdato
-
-            WHEN NOT MATCHED THEN
-                INSERT (
-                    Id, Firmanavn, Adresse, CVR, Att,
-                    Serveringszone, Udeserveringstype, UdeserveringstypeOptionId,
-                    Serveringsareal, Facadelaengde,
-                    GaeldendeFra, GaeldendeTilOgMed,
-                    Sommersaeson, Vintermaaneder,
-                    Workflow, WorkflowOptionId,
-                    Ansogningsdato
-                )
-                VALUES (
-                    source.Id, source.Firmanavn, source.Adresse, source.CVR, source.Att,
-                    source.Serveringszone, source.Udeserveringstype, source.UdeserveringstypeOptionId,
-                    source.Serveringsareal, source.Facadelaengde,
-                    source.GaeldendeFra, source.GaeldendeTilOgMed,
-                    source.Sommersaeson, source.Vintermaaneder,
-                    source.Workflow, source.WorkflowOptionId,
-                    source.Ansogningsdato
-                );
-            """,
-            (
-                deskpro_id,
-                firmanavn,
-                adresse,
-                cvr,
-                att,
-                serveringszone,
-                type_title,
-                type_id,
-                serveringsareal,
-                facadelaengde,
-                gaeldende_fra_sql,
-                gaeldende_til_sql,
-                sommersaeson_text,
-                vintermaaneder_text,
-                workflow_title,
-                workflow_id,
-                ansogningsdato_sql,
-            ),
-        )
-
-        if type_id == OPT_TYPE_SPECIAL:
-            special_count += 1
-
-        # -------- Generate / refresh fakturalinjer for this tilladelse --------
-        if not startdato:
-            skipped_invalid += 1
-            continue
-
-        # Lines only once kassen has approved the tilladelse (dobbelttjek).
-        # Until then — or after it's set back to Afventer, or Afvist — any Ny
-        # lines are removed below.
-        if kassen_status.get(deskpro_id) == KASSEN_GODKENDT:
-            wanted = billable_year_months(startdato, slutdato, horizon, billable_months)
-        else:
-            wanted = []
-            if type_id != OPT_TYPE_SPECIAL:
-                afventer_count += 1
-
-        # Existing lines for this tilladelse, keyed by (year, month).
-        cursor.execute(
-            """
-            SELECT FakturaLinjeID, FakturaMaaned, FakturaAar, FakturaStatus
-            FROM dbo.BrugAarhus_Udeservering_Fakturalinjer
-            WHERE DeskproID = ?;
-            """,
-            (deskpro_id,),
-        )
-        existing = {}
-        for row in cursor.fetchall():
-            m = MONTH_NAME_TO_NUM.get((row.FakturaMaaned or "").split(" ")[0])
-            if m:
-                existing[(int(row.FakturaAar), m)] = (row.FakturaLinjeID, row.FakturaStatus)
-
-        # Ny lines that are no longer wanted: out of sæson, past a (new)
-        # slutdato, or the type became special.
-        # Locked statuses (TilFakturering / Faktureret / FakturerIkke) stay.
-        for ym, (linje_id, status) in existing.items():
-            if ym in wanted:
-                continue
-            if status == "Ny":
-                cursor.execute(
-                    "DELETE FROM dbo.BrugAarhus_Udeservering_Fakturalinjer "
-                    "WHERE FakturaLinjeID = ? AND FakturaStatus = 'Ny';",
-                    (linje_id,),
-                )
-                deleted_count += 1
-
-        for (y, m) in wanted:
-            month_name = MONTH_NUM_TO_NAME[m]
-
-            if (y, m) in existing:
-                linje_id, status = existing[(y, m)]
-                if status != "Ny":
-                    skipped_locked += 1
-                    continue
-                cursor.execute(
-                    """
-                    UPDATE dbo.BrugAarhus_Udeservering_Fakturalinjer
-                    SET Firmanavn                 = ?,
-                        Adresse                   = ?,
-                        CVR                       = ?,
-                        Att                       = ?,
-                        Serveringszone            = ?,
-                        Udeserveringstype         = ?,
-                        UdeserveringstypeOptionId = ?,
-                        Serveringsareal           = ?,
-                        Facadelaengde             = ?,
-                        Ansogningsdato            = ?
-                    WHERE FakturaLinjeID = ?
-                      AND FakturaStatus = 'Ny';
-                    """,
-                    (
-                        firmanavn,
-                        adresse,
-                        cvr,
-                        att,
-                        serveringszone,
-                        type_title,
-                        type_id,
-                        serveringsareal,
-                        facadelaengde,
-                        ansogningsdato_sql,
-                        linje_id,
-                    ),
-                )
-                updated_count += 1
-                continue
-
-            cursor.execute(
-                """
-                INSERT INTO dbo.BrugAarhus_Udeservering_Fakturalinjer (
-                    DeskproID,
-                    FakturaMaaned,
-                    FakturaAar,
-                    FakturaDatoSort,
-                    Firmanavn,
-                    Adresse,
-                    CVR,
-                    Att,
-                    Serveringszone,
-                    Udeserveringstype,
-                    UdeserveringstypeOptionId,
-                    Serveringsareal,
-                    Facadelaengde,
-                    Ansogningsdato,
-                    FakturaStatus
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Ny');
-                """,
-                (
-                    deskpro_id,
-                    month_name,
-                    y,
-                    datetime(y, m, 1),
-                    firmanavn,
-                    adresse,
-                    cvr,
-                    att,
-                    serveringszone,
-                    type_title,
-                    type_id,
-                    serveringsareal,
-                    facadelaengde,
-                    ansogningsdato_sql,
-                ),
-            )
-            inserted_count += 1
-
+        cursor.execute(MERGE_SQL, tilladelse_params(ticket))
     conn.commit()
-
-    orchestrator_connection.log_info(
-        "Refresh complete. "
-        f"Inserted: {inserted_count}, "
-        f"Updated Ny: {updated_count}, "
-        f"Deleted (no longer billable Ny): {deleted_count}, "
-        f"Skipped (locked): {skipped_locked}, "
-        f"Skipped (no startdato): {skipped_invalid}, "
-        f"Specialtilladelser (no lines): {special_count}, "
-        f"Not approved in kassen (no lines): {afventer_count}"
-    )
-
     cursor.close()
     conn.close()
+    orchestrator_connection.log_info(f"Synced {len(all_data)} tilladelser from Deskpro.")
+
+    # -------------------------------
+    # Fakturalinjer: kassen's job. Committed above, so kassen sees the data.
+    # -------------------------------
+    opdater_fakturalinjer_i_kassen(orchestrator_connection, [t["id"] for t in all_data])
+
+
+MERGE_SQL = """
+    MERGE [dbo].[BrugAarhus_Udeservering] AS target
+    USING (
+        SELECT
+            ? AS Id,
+            ? AS Firmanavn,
+            ? AS Adresse,
+            ? AS CVR,
+            ? AS Att,
+            ? AS Serveringszone,
+            ? AS Udeserveringstype,
+            ? AS UdeserveringstypeOptionId,
+            ? AS Serveringsareal,
+            ? AS Facadelaengde,
+            ? AS GaeldendeFra,
+            ? AS GaeldendeTilOgMed,
+            ? AS Sommersaeson,
+            ? AS Vintermaaneder,
+            ? AS Workflow,
+            ? AS WorkflowOptionId,
+            ? AS Ansogningsdato
+    ) AS source
+    ON (target.Id = source.Id)
+
+    WHEN MATCHED THEN
+        UPDATE SET
+            Firmanavn                 = source.Firmanavn,
+            Adresse                   = source.Adresse,
+            CVR                       = source.CVR,
+            Att                       = source.Att,
+            Serveringszone            = source.Serveringszone,
+            Udeserveringstype         = source.Udeserveringstype,
+            UdeserveringstypeOptionId = source.UdeserveringstypeOptionId,
+            Serveringsareal           = source.Serveringsareal,
+            Facadelaengde             = source.Facadelaengde,
+            GaeldendeFra              = source.GaeldendeFra,
+            GaeldendeTilOgMed         = source.GaeldendeTilOgMed,
+            Sommersaeson              = source.Sommersaeson,
+            Vintermaaneder            = source.Vintermaaneder,
+            Workflow                  = source.Workflow,
+            WorkflowOptionId          = source.WorkflowOptionId,
+            Ansogningsdato            = source.Ansogningsdato
+
+    WHEN NOT MATCHED THEN
+        INSERT (
+            Id, Firmanavn, Adresse, CVR, Att,
+            Serveringszone, Udeserveringstype, UdeserveringstypeOptionId,
+            Serveringsareal, Facadelaengde,
+            GaeldendeFra, GaeldendeTilOgMed,
+            Sommersaeson, Vintermaaneder,
+            Workflow, WorkflowOptionId,
+            Ansogningsdato
+        )
+        VALUES (
+            source.Id, source.Firmanavn, source.Adresse, source.CVR, source.Att,
+            source.Serveringszone, source.Udeserveringstype, source.UdeserveringstypeOptionId,
+            source.Serveringsareal, source.Facadelaengde,
+            source.GaeldendeFra, source.GaeldendeTilOgMed,
+            source.Sommersaeson, source.Vintermaaneder,
+            source.Workflow, source.WorkflowOptionId,
+            source.Ansogningsdato
+        );
+"""
+
+
+def tilladelse_params(ticket: dict) -> tuple:
+    """The MERGE parameters for one Deskpro ticket, in MERGE_SQL's order."""
+    fields = ticket.get("fields", {}) or {}
+
+    type_id = get_type_id(fields)
+    type_title = safe_get_first_detail_title(fields, FIELD_UDESERVERINGSTYPE) or TYPE_FALLBACK_TITLE[type_id]
+
+    startdato = parse_deskpro_date(safe_get_value(fields, FIELD_STARTDATO))
+    slutdato = parse_deskpro_date(safe_get_value(fields, FIELD_SLUTDATO))
+    ansogningsdato = parse_deskpro_dt(ticket.get("date_created"))
+
+    # Season mirrors — kassen bills from these.
+    sommersaeson_text, vintermaaneder_text = compute_saeson_text(type_id, fields)
+
+    return (
+        ticket.get("id"),
+        safe_get_value(fields, FIELD_FIRMANAVN),
+        safe_get_value(fields, FIELD_ADRESSE),
+        safe_get_value(fields, FIELD_CVR),
+        ticket.get("_att_name"),
+        safe_get_first_detail_title(fields, FIELD_ZONE),
+        type_title,
+        type_id,
+        safe_get_value(fields, FIELD_SERVERINGSAREAL),
+        safe_get_value(fields, FIELD_FACADELAENGDE),
+        startdato.strftime("%Y-%m-%d") if startdato else None,
+        slutdato.strftime("%Y-%m-%d") if slutdato else None,
+        sommersaeson_text,
+        vintermaaneder_text,
+        # Mirrored so kassen can warn when a tilladelse it still bills has
+        # left "Ansøgning godkendt" in Deskpro.
+        safe_get_first_detail_title(fields, FIELD_WORKFLOW),
+        safe_get_single_select_id(fields, FIELD_WORKFLOW),
+        ansogningsdato.strftime("%Y-%m-%d %H:%M:%S") if ansogningsdato else None,
+    )
+
+
+# =============================================================================
+# KASSEN
+# =============================================================================
+def opdater_fakturalinjer_i_kassen(orchestrator_connection, ids: list[int]) -> None:
+    """Ask BrugAarhus Kassen to bring the fakturalinjer of these tilladelser up
+    to date. Credential BrugAarhusKassenAPI: username = kassen's base URL,
+    password = the API key (BRUGAARHUS_ROBOT_API_KEY on the IIS site).
+
+    A failure is logged, not raised: the Deskpro data is already saved, and the
+    lines are brought up to date by kassen itself, or on the next run."""
+    if not ids:
+        return
+    cred = orchestrator_connection.get_credential("BrugAarhusKassenAPI")
+    url = f"{cred.username.rstrip('/')}/udeservering/api/fakturalinjer/dan"
+    headers = {"X-API-Key": cred.password}
+
+    totals = {"tilladelser": 0, "dannet": 0, "opdateret": 0, "slettet": 0}
+    failed = 0
+    ids = sorted(set(ids))
+    for i in range(0, len(ids), KASSEN_CHUNK):
+        chunk = ids[i:i + KASSEN_CHUNK]
+        try:
+            resp = requests.post(url, json={"ids": chunk}, headers=headers, timeout=120)
+        except requests.RequestException as exc:
+            failed += len(chunk)
+            orchestrator_connection.log_error(f"Kassen unreachable for fakturalinjer: {exc}")
+            continue
+        if resp.status_code != 200:
+            failed += len(chunk)
+            orchestrator_connection.log_error(
+                f"Kassen refused fakturalinjer ({resp.status_code}): {resp.text[:300]}"
+            )
+            continue
+        body = resp.json()
+        for key in totals:
+            totals[key] += int(body.get(key) or 0)
+
+    orchestrator_connection.log_info(
+        "Fakturalinjer via kassen: "
+        f"{totals['tilladelser']} tilladelser, {totals['dannet']} created, "
+        f"{totals['opdateret']} updated, {totals['slettet']} deleted"
+        + (f", {failed} tilladelser NOT updated (see errors)" if failed else "")
+    )
 
 
 # =============================================================================
@@ -514,12 +370,6 @@ def fetch_ticket(orchestrator_connection, base_url: str, headers: dict, ticket_i
     return ticket
 
 
-def load_kassen_status(cursor) -> dict[int, str]:
-    """KassenStatus per tilladelse already in kassen, as set by sagsbehandlere."""
-    cursor.execute("SELECT Id, KassenStatus FROM dbo.BrugAarhus_Udeservering;")
-    return {int(r.Id): r.KassenStatus for r in cursor.fetchall()}
-
-
 def kassen_ids_to_follow(cursor) -> list[int]:
     """Tilladelser already in kassen that still matter: active (no slutdato,
     or one in this month or later) or with Ny lines not yet approved. Ended
@@ -540,7 +390,7 @@ def kassen_ids_to_follow(cursor) -> list[int]:
 
 
 # =============================================================================
-# BILLING RULES
+# FIELD MAPPING
 # =============================================================================
 def get_type_id(fields: dict) -> int:
     """Udeserveringstype option id. Missing/unknown → Alm. udeservering, the
@@ -549,47 +399,11 @@ def get_type_id(fields: dict) -> int:
     return type_id if type_id in TYPE_FALLBACK_TITLE else OPT_TYPE_ALM
 
 
-def compute_billable_months(type_id: int, fields: dict) -> set[int]:
-    """Month numbers (1–12) the tilladelse is billed in: Sommersæson Ja →
-    Apr–Sep, plus each selected winter month. The same for every type except
-    specialtilladelse, which is never billed (empty set). Rules such as
-    "parklet only in summer" live in the Deskpro form and the guidelines, so
-    they can change without touching this code."""
-    if type_id == OPT_TYPE_SPECIAL:
-        return set()
-
-    months: set[int] = set()
-    if OPT_SOMMER_JA in safe_get_multi_select_ids(fields, FIELD_SOMMERSAESON):
-        months.update(SUMMER_MONTHS)
-    vinter_ids = safe_get_multi_select_ids(fields, FIELD_VINTERSAESON)
-    months.update(WINTER_OPT_TO_MONTH[oid] for oid in vinter_ids if oid in WINTER_OPT_TO_MONTH)
-    return months
-
-
-def billable_year_months(
-    startdato: date,
-    slutdato: date | None,
-    horizon: tuple[int, int],
-    billable_months: set[int],
-) -> list[tuple[int, int]]:
-    """(year, month) pairs that should have a fakturalinje: every billable
-    month from the start month through the end month (both billed in full),
-    capped at the horizon for open-ended (fortløbende) tilladelser."""
-    gen_from = (startdato.year, startdato.month)
-    gen_to = horizon
-    if slutdato:
-        gen_to = min(gen_to, (slutdato.year, slutdato.month))
-    return [ym for ym in iter_year_months(gen_from, gen_to) if ym[1] in billable_months]
-
-
 def compute_saeson_text(type_id: int, fields: dict) -> tuple[str | None, str | None]:
-    """Return human-readable mirrors of the Sommer/Vinter selections so
-    Kassen can show them on the tilladelse without re-reading Deskpro.
-
-    Sommersaeson    : "Ja" / "Nej" / None (unanswered, or specialtilladelse)
-    Vintermaaneder  : "Oktober, November, December" / None (none selected,
-                      or specialtilladelse)
-    """
+    """Human-readable mirrors of the Sommer/Vinter selections. Kassen bills
+    from these, so keep the format: Sommersaeson "Ja" / "Nej" / None,
+    Vintermaaneder Danish month names joined by ", " (Oktober → Marts order).
+    Specialtilladelser are never billed: (None, None)."""
     if type_id == OPT_TYPE_SPECIAL:
         return None, None
 
@@ -612,22 +426,6 @@ def compute_saeson_text(type_id: int, fields: dict) -> tuple[str | None, str | N
 # =============================================================================
 # HELPERS
 # =============================================================================
-def add_months(year: int, month: int, delta: int) -> tuple[int, int]:
-    idx = (year * 12 + (month - 1)) + delta
-    return (idx // 12, idx % 12 + 1)
-
-
-def iter_year_months(start: tuple[int, int], end: tuple[int, int]):
-    y, m = start
-    ey, em = end
-    while (y, m) <= (ey, em):
-        yield (y, m)
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-
-
 def safe_get_value(field_dict: dict, key: str, default=None):
     try:
         return field_dict[key].get("value", default)

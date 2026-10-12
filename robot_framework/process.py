@@ -21,18 +21,20 @@ FIELD_WORKFLOW = "1147"            # Workflow (sagsstatus)
 FIELD_ZONE = "1216"                # Zone (1 / 2)
 FIELD_UDESERVERINGSTYPE = "1192"   # Alm. udeservering / Parklet / Specialtilladelse
 FIELD_SERVERINGSAREAL = "1196"     # m2 — all types
-FIELD_FACADELAENGDE = "1210"       # only shown for Alm. udeservering
+FIELD_FACADELAENGDE = "1210"       # the form shows it for Alm. udeservering
 
-# Periode — both shared by all types. A slutdato works like an opsigelse.
+# Periode — shared by all types, both set by the sagsbehandler. A slutdato
+# works like an opsigelse; no slutdato = fortløbende.
 FIELD_STARTDATO = "1291"
 FIELD_SLUTDATO = "1292"
 
-# Sæson — drives which months a tilladelse actually gets billed in
-FIELD_SOMMERSAESON = "64"          # Radio: Ja (65) → all six summer months. Alm. + parklet.
-FIELD_VINTERSAESON = "67"          # Checkbox multi: each selected month. Alm. only.
+# Sæson — drives which months a tilladelse actually gets billed in. Which
+# types show which season field is decided by the Deskpro form, not here.
+FIELD_SOMMERSAESON = "64"          # Radio: Ja (65) → all six summer months
+FIELD_VINTERSAESON = "67"          # Checkbox multi: each selected month is billable
 
-# Fakturering trigger from Deskpro side
-FIELD_FAKTURERINGSSTATUS = "1228"  # Send (1229) / Send ikke (1230)
+# Deskpro department of the udeservering form ("TEST - Udeservering").
+DEPARTMENT_ID = 23
 
 
 # =============================================================================
@@ -41,20 +43,19 @@ FIELD_FAKTURERINGSSTATUS = "1228"  # Send (1229) / Send ikke (1230)
 # Udeserveringstype (field 1192)
 OPT_TYPE_ALM = 1193        # "Alm. udeservering (fortløbende)"
 OPT_TYPE_SPECIAL = 1194    # "Specialtilladelse (tidsbegrænset)" — never invoiced
-OPT_TYPE_PARKLET = 1195    # "Parklet (pr. sæson)" — summer only, one season
+OPT_TYPE_PARKLET = 1195    # "Parklet (pr. sæson)"
 TYPE_FALLBACK_TITLE = {
     OPT_TYPE_ALM: "Alm. udeservering (fortløbende)",
     OPT_TYPE_SPECIAL: "Specialtilladelse (tidsbegrænset)",
     OPT_TYPE_PARKLET: "Parklet (pr. sæson)",
 }
 
-OPT_WORKFLOW_GODKENDT = 1151
+OPT_WORKFLOW_GODKENDT = 1151   # "Ansøgning godkendt" → the tilladelse enters kassen
 
 # Sommersæson Ja → all six months of April through September
 OPT_SOMMER_JA = 65
 OPT_SOMMER_NEJ = 66
 SUMMER_MONTHS = (4, 5, 6, 7, 8, 9)
-SUMMER_LAST_MONTH = 9
 
 # Vintersæson option → month number. The option-id order (68→73) is the
 # natural Danish winter-season order (Oktober → Marts).
@@ -74,8 +75,6 @@ WINTER_OPT_TO_NAME = {
     72: "Februar",
     73: "Marts",
 }
-
-OPT_FAKTURERING_SEND = 1229
 
 
 # How many months ahead of "now" we generate fakturalinjer for when the
@@ -117,22 +116,39 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     cursor = conn.cursor()
 
     # -------------------------------
-    # Fetch. Two queries, merged by id:
-    #   - tickets marked "Send til fakturering" (the billable ones)
-    #   - specialtilladelser — never invoiced, but kassen shows them in
-    #     Tilladelser + statistik, so they're synced whatever 1228 says.
+    # Fetch. A tilladelse enters kassen when its Workflow is "Ansøgning
+    # godkendt" in the udeservering department — every type, specials too.
+    # Once in kassen it stays, whatever happens to the status in Deskpro, and
+    # its data (slutdato, m2, …) keeps flowing to the Ny lines. So tilladelser
+    # already in kassen that still matter, but are no longer godkendt, are
+    # fetched one by one. Kassen warns about the changed status.
+    #
+    # One query per ticket status (like sandbox.py): an approved tilladelse is
+    # often a resolved or archived ticket.
     # -------------------------------
     tickets_by_id: dict[int, dict] = {}
-    for query in (
-        f"ticket_field.{FIELD_FAKTURERINGSSTATUS}={OPT_FAKTURERING_SEND}",
-        f"ticket_field.{FIELD_UDESERVERINGSTYPE}={OPT_TYPE_SPECIAL}",
-    ):
+    for status in fetch_ticket_statuses(base_url, headers):
+        if status.startswith("hidden"):  # spam / deleted / awaiting validation
+            continue
+        query = (
+            f"department={DEPARTMENT_ID}&status={status}"
+            f"&ticket_field.{FIELD_WORKFLOW}={OPT_WORKFLOW_GODKENDT}"
+        )
         for ticket in fetch_tickets(orchestrator_connection, base_url, headers, query):
             tickets_by_id[ticket["id"]] = ticket
+    godkendt_count = len(tickets_by_id)
 
-    all_data = [t for t in tickets_by_id.values() if is_in_scope(t.get("fields", {}) or {})]
+    for deskpro_id in kassen_ids_to_follow(cursor):
+        if deskpro_id in tickets_by_id:
+            continue
+        ticket = fetch_ticket(orchestrator_connection, base_url, headers, deskpro_id)
+        if ticket:
+            tickets_by_id[deskpro_id] = ticket
+
+    all_data = list(tickets_by_id.values())
     orchestrator_connection.log_info(
-        f"Fetched {len(tickets_by_id)} tickets from API, {len(all_data)} in scope."
+        f"Fetched {godkendt_count} godkendte tickets + "
+        f"{len(all_data) - godkendt_count} already in kassen that are no longer godkendt."
     )
 
     # -------------------------------
@@ -165,14 +181,16 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         type_id = get_type_id(fields)
         type_title = safe_get_first_detail_title(fields, FIELD_UDESERVERINGSTYPE) or TYPE_FALLBACK_TITLE[type_id]
 
+        # Mirrored so kassen can warn when a tilladelse it still bills has left
+        # "Ansøgning godkendt" in Deskpro. Billing itself ignores it.
+        workflow_id = safe_get_single_select_id(fields, FIELD_WORKFLOW)
+        workflow_title = safe_get_first_detail_title(fields, FIELD_WORKFLOW)
+
         serveringsareal = safe_get_value(fields, FIELD_SERVERINGSAREAL)
-        # Fields hidden for a type keep their old value in Deskpro if the type
-        # was changed later — only read them for the type that shows them.
-        facadelaengde = safe_get_value(fields, FIELD_FACADELAENGDE) if type_id == OPT_TYPE_ALM else None
+        facadelaengde = safe_get_value(fields, FIELD_FACADELAENGDE)
 
         startdato = parse_deskpro_date(safe_get_value(fields, FIELD_STARTDATO))
         slutdato = parse_deskpro_date(safe_get_value(fields, FIELD_SLUTDATO))
-        effective_til = compute_effective_end(type_id, startdato, slutdato)
 
         # Sæson billable-month set — computed fresh from the ticket every run.
         # Empty set (nothing selected, or a specialtilladelse) means *no*
@@ -187,7 +205,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 
         ansogningsdato_sql = ansogningsdato.strftime("%Y-%m-%d %H:%M:%S") if ansogningsdato else None
         gaeldende_fra_sql = startdato.strftime("%Y-%m-%d") if startdato else None
-        gaeldende_til_sql = effective_til.strftime("%Y-%m-%d") if effective_til else None
+        gaeldende_til_sql = slutdato.strftime("%Y-%m-%d") if slutdato else None
 
         # -------- Upsert Udeservering --------
         cursor.execute(
@@ -209,6 +227,8 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     ? AS GaeldendeTilOgMed,
                     ? AS Sommersaeson,
                     ? AS Vintermaaneder,
+                    ? AS Workflow,
+                    ? AS WorkflowOptionId,
                     ? AS Ansogningsdato
             ) AS source
             ON (target.Id = source.Id)
@@ -228,6 +248,8 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     GaeldendeTilOgMed         = source.GaeldendeTilOgMed,
                     Sommersaeson              = source.Sommersaeson,
                     Vintermaaneder            = source.Vintermaaneder,
+                    Workflow                  = source.Workflow,
+                    WorkflowOptionId          = source.WorkflowOptionId,
                     Ansogningsdato            = source.Ansogningsdato
 
             WHEN NOT MATCHED THEN
@@ -237,6 +259,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     Serveringsareal, Facadelaengde,
                     GaeldendeFra, GaeldendeTilOgMed,
                     Sommersaeson, Vintermaaneder,
+                    Workflow, WorkflowOptionId,
                     Ansogningsdato
                 )
                 VALUES (
@@ -245,6 +268,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     source.Serveringsareal, source.Facadelaengde,
                     source.GaeldendeFra, source.GaeldendeTilOgMed,
                     source.Sommersaeson, source.Vintermaaneder,
+                    source.Workflow, source.WorkflowOptionId,
                     source.Ansogningsdato
                 );
             """,
@@ -263,6 +287,8 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 gaeldende_til_sql,
                 sommersaeson_text,
                 vintermaaneder_text,
+                workflow_title,
+                workflow_id,
                 ansogningsdato_sql,
             ),
         )
@@ -275,7 +301,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             skipped_invalid += 1
             continue
 
-        wanted = billable_year_months(startdato, effective_til, horizon, billable_months)
+        wanted = billable_year_months(startdato, slutdato, horizon, billable_months)
 
         # Existing lines for this tilladelse, keyed by (year, month).
         cursor.execute(
@@ -293,7 +319,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 existing[(int(row.FakturaAar), m)] = (row.FakturaLinjeID, row.FakturaStatus)
 
         # Ny lines that are no longer wanted: out of sæson, past a (new)
-        # slutdato, past parklet's season end, or the type became special.
+        # slutdato, or the type became special.
         # Locked statuses (TilFakturering / Faktureret / FakturerIkke) stay.
         for ym, (linje_id, status) in existing.items():
             if ym in wanted:
@@ -406,9 +432,27 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 # =============================================================================
 # FETCH
 # =============================================================================
+def fetch_ticket_statuses(base_url: str, headers: dict) -> list[str]:
+    """Ticket statuses (awaiting_agent, resolved, archived, …) via the old
+    statuses endpoint, as in sandbox.py."""
+    resp = requests.get(f"{base_url}/api/v2/20190110/ticket_statuses", headers=headers, timeout=60)
+    resp.raise_for_status()
+    return [str(s).strip() for s in (resp.json().get("data") or []) if str(s).strip()]
+
+
+def _stamp_att(tickets: list[dict], payload: dict) -> None:
+    """Applicant name from include=person (linked.person.<id>.name) → Att."""
+    linked = payload.get("linked", {}) if isinstance(payload.get("linked"), dict) else {}
+    person_map = linked.get("person", {}) if isinstance(linked.get("person"), dict) else {}
+    for ticket in tickets:
+        person = person_map.get(str(ticket.get("person")))
+        if isinstance(person, dict):
+            ticket["_att_name"] = person.get("name") or person.get("display_name")
+
+
 def fetch_tickets(orchestrator_connection, base_url: str, headers: dict, filter_query: str) -> list[dict]:
-    """All pages of /api/v2/tickets?<filter_query>, each ticket stamped with its
-    applicant name (include=person → linked.person.<id>.name → Att)."""
+    """All pages of /api/v2/tickets?<filter_query>, each ticket stamped with
+    its applicant name."""
     api_url = f"{base_url}/api/v2/tickets?{filter_query}&include=person&count=100"
     out: list[dict] = []
     page = 1
@@ -423,16 +467,7 @@ def fetch_tickets(orchestrator_connection, base_url: str, headers: dict, filter_
         payload = resp.json()
         data = payload.get("data", [])
         pagination = (payload.get("meta", {}) or {}).get("pagination", {})
-        linked = payload.get("linked", {}) if isinstance(payload.get("linked"), dict) else {}
-        person_map = linked.get("person", {}) if isinstance(linked.get("person"), dict) else {}
-
-        for ticket in data:
-            pid = ticket.get("person")
-            if pid is None:
-                continue
-            person = person_map.get(str(pid))
-            if isinstance(person, dict):
-                ticket["_att_name"] = person.get("name") or person.get("display_name")
+        _stamp_att(data, payload)
 
         if not data:
             break
@@ -443,13 +478,41 @@ def fetch_tickets(orchestrator_connection, base_url: str, headers: dict, filter_
     return out
 
 
-def is_in_scope(fields: dict) -> bool:
-    """Specialtilladelser are synced when approved (workflow = godkendt).
-    Every other type only when the sagsbehandler has marked it "Send til
-    fakturering"."""
-    if get_type_id(fields) == OPT_TYPE_SPECIAL:
-        return OPT_WORKFLOW_GODKENDT in safe_get_multi_select_ids(fields, FIELD_WORKFLOW)
-    return OPT_FAKTURERING_SEND in safe_get_multi_select_ids(fields, FIELD_FAKTURERINGSSTATUS)
+def fetch_ticket(orchestrator_connection, base_url: str, headers: dict, ticket_id: int) -> dict | None:
+    """One ticket via /api/v2/tickets/{id}, stamped with its applicant name.
+    None (and logged) if it can't be fetched, e.g. deleted — kassen then
+    keeps the data it has."""
+    resp = requests.get(f"{base_url}/api/v2/tickets/{ticket_id}?include=person", headers=headers, timeout=60)
+    if resp.status_code != 200:
+        orchestrator_connection.log_error(
+            f"Could not fetch ticket {ticket_id}: {resp.status_code} {resp.text[:300]}"
+        )
+        return None
+    payload = resp.json()
+    ticket = payload.get("data")
+    if not isinstance(ticket, dict):
+        return None
+    _stamp_att([ticket], payload)
+    return ticket
+
+
+def kassen_ids_to_follow(cursor) -> list[int]:
+    """Tilladelser already in kassen that still matter: active (no slutdato,
+    or one in this month or later) or with Ny lines not yet approved. Ended
+    tilladelser with only locked lines have nothing left to update."""
+    cursor.execute(
+        """
+        SELECT u.Id
+        FROM dbo.BrugAarhus_Udeservering u
+        WHERE u.GaeldendeTilOgMed IS NULL
+           OR u.GaeldendeTilOgMed >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+           OR EXISTS (
+                SELECT 1 FROM dbo.BrugAarhus_Udeservering_Fakturalinjer f
+                WHERE f.DeskproID = u.Id AND f.FakturaStatus = 'Ny'
+           );
+        """
+    )
+    return [int(r.Id) for r in cursor.fetchall()]
 
 
 # =============================================================================
@@ -462,52 +525,36 @@ def get_type_id(fields: dict) -> int:
     return type_id if type_id in TYPE_FALLBACK_TITLE else OPT_TYPE_ALM
 
 
-def parklet_season_end(startdato: date) -> date:
-    """A parklet is valid for one summer season only. A start after
-    September belongs to next year's season."""
-    year = startdato.year if startdato.month <= SUMMER_LAST_MONTH else startdato.year + 1
-    return date(year, SUMMER_LAST_MONTH, 30)
-
-
-def compute_effective_end(type_id: int, startdato: date | None, slutdato: date | None) -> date | None:
-    """The date the tilladelse ends, as stored in GaeldendeTilOgMed (kassen's
-    "aktiv" filter reads it). For parklet: the slutdato or the end of its
-    season, whichever comes first — even without a slutdato."""
-    if type_id == OPT_TYPE_PARKLET and startdato:
-        season_end = parklet_season_end(startdato)
-        return min(slutdato, season_end) if slutdato else season_end
-    return slutdato
-
-
 def compute_billable_months(type_id: int, fields: dict) -> set[int]:
-    """Month numbers (1–12) the tilladelse is billed in.
-    Alm.: Sommersæson Ja → Apr–Sep, plus each selected winter month.
-    Parklet: summer only. Specialtilladelse: never billed → empty set."""
+    """Month numbers (1–12) the tilladelse is billed in: Sommersæson Ja →
+    Apr–Sep, plus each selected winter month. The same for every type except
+    specialtilladelse, which is never billed (empty set). Rules such as
+    "parklet only in summer" live in the Deskpro form and the guidelines, so
+    they can change without touching this code."""
     if type_id == OPT_TYPE_SPECIAL:
         return set()
 
     months: set[int] = set()
     if OPT_SOMMER_JA in safe_get_multi_select_ids(fields, FIELD_SOMMERSAESON):
         months.update(SUMMER_MONTHS)
-    if type_id == OPT_TYPE_ALM:
-        vinter_ids = safe_get_multi_select_ids(fields, FIELD_VINTERSAESON)
-        months.update(WINTER_OPT_TO_MONTH[oid] for oid in vinter_ids if oid in WINTER_OPT_TO_MONTH)
+    vinter_ids = safe_get_multi_select_ids(fields, FIELD_VINTERSAESON)
+    months.update(WINTER_OPT_TO_MONTH[oid] for oid in vinter_ids if oid in WINTER_OPT_TO_MONTH)
     return months
 
 
 def billable_year_months(
     startdato: date,
-    effective_til: date | None,
+    slutdato: date | None,
     horizon: tuple[int, int],
     billable_months: set[int],
 ) -> list[tuple[int, int]]:
     """(year, month) pairs that should have a fakturalinje: every billable
     month from the start month through the end month (both billed in full),
-    capped at the horizon for open-ended tilladelser."""
+    capped at the horizon for open-ended (fortløbende) tilladelser."""
     gen_from = (startdato.year, startdato.month)
     gen_to = horizon
-    if effective_til:
-        gen_to = min(gen_to, (effective_til.year, effective_til.month))
+    if slutdato:
+        gen_to = min(gen_to, (slutdato.year, slutdato.month))
     return [ym for ym in iter_year_months(gen_from, gen_to) if ym[1] in billable_months]
 
 
@@ -517,7 +564,7 @@ def compute_saeson_text(type_id: int, fields: dict) -> tuple[str | None, str | N
 
     Sommersaeson    : "Ja" / "Nej" / None (unanswered, or specialtilladelse)
     Vintermaaneder  : "Oktober, November, December" / None (none selected,
-                      parklet or specialtilladelse)
+                      or specialtilladelse)
     """
     if type_id == OPT_TYPE_SPECIAL:
         return None, None
@@ -529,9 +576,6 @@ def compute_saeson_text(type_id: int, fields: dict) -> tuple[str | None, str | N
         sommer_text = "Nej"
     else:
         sommer_text = None
-
-    if type_id != OPT_TYPE_ALM:
-        return sommer_text, None
 
     vinter_ids = safe_get_multi_select_ids(fields, FIELD_VINTERSAESON)
     # Sort by option-id so months come out in Okt→Nov→Dec→Jan→Feb→Marts order.

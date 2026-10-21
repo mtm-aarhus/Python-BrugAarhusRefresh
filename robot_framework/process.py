@@ -5,6 +5,9 @@ BrugAarhus_Udeservering — nothing else. The fakturalinjer are BrugAarhus
 Kassen's job: after the sync the robot asks kassen to bring the lines of the
 synced tilladelser up to date (POST /udeservering/api/fakturalinjer/dan), which
 keeps the rolling horizon moving and picks up changes from Deskpro.
+
+linear_framework tells kassen when a run starts and how it ended
+(meld_synkronisering), so kassen can lock its Synkroniser button meanwhile.
 """
 
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
@@ -81,7 +84,9 @@ WINTER_OPT_TO_NAME = {
 # =============================================================================
 # PROCESS
 # =============================================================================
-def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
+def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> dict:
+    """Sync and return the counts that kassen shows for the run:
+    {"tilladelser", "dannet", "opdateret", "slettet"}."""
     orchestrator_connection.log_trace("Running process.")
 
     brugaarhus_api_cred = orchestrator_connection.get_credential("BrugAarhusAPI")
@@ -153,7 +158,8 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     # -------------------------------
     # Fakturalinjer: kassen's job. Committed above, so kassen sees the data.
     # -------------------------------
-    opdater_fakturalinjer_i_kassen(orchestrator_connection, [t["id"] for t in all_data])
+    linjer = opdater_fakturalinjer_i_kassen(orchestrator_connection, [t["id"] for t in all_data])
+    return {**linjer, "tilladelser": len(all_data)}
 
 
 MERGE_SQL = """
@@ -261,20 +267,21 @@ def tilladelse_params(ticket: dict) -> tuple:
 # =============================================================================
 # KASSEN
 # =============================================================================
-def opdater_fakturalinjer_i_kassen(orchestrator_connection, ids: list[int]) -> None:
+def opdater_fakturalinjer_i_kassen(orchestrator_connection, ids: list[int]) -> dict:
     """Ask BrugAarhus Kassen to bring the fakturalinjer of these tilladelser up
     to date. Credential BrugAarhusKassenAPI: username = kassen's base URL,
     password = the API key (BRUGAARHUS_ROBOT_API_KEY on the IIS site).
+    Returns kassen's totals: {"dannet", "opdateret", "slettet"}.
 
     A failure is logged, not raised: the Deskpro data is already saved, and the
     lines are brought up to date by kassen itself, or on the next run."""
+    totals = {"tilladelser": 0, "dannet": 0, "opdateret": 0, "slettet": 0}
     if not ids:
-        return
+        return {k: v for k, v in totals.items() if k != "tilladelser"}
     cred = orchestrator_connection.get_credential("BrugAarhusKassenAPI")
     url = f"{cred.username.rstrip('/')}/udeservering/api/fakturalinjer/dan"
     headers = {"X-API-Key": cred.password}
 
-    totals = {"tilladelser": 0, "dannet": 0, "opdateret": 0, "slettet": 0}
     failed = 0
     ids = sorted(set(ids))
     for i in range(0, len(ids), KASSEN_CHUNK):
@@ -301,6 +308,35 @@ def opdater_fakturalinjer_i_kassen(orchestrator_connection, ids: list[int]) -> N
         f"{totals['opdateret']} updated, {totals['slettet']} deleted"
         + (f", {failed} tilladelser NOT updated (see errors)" if failed else "")
     )
+    return {k: v for k, v in totals.items() if k != "tilladelser"}
+
+
+def meld_synkronisering(orchestrator_connection, status: str, sync_id: int | None = None,
+                        **detaljer) -> int | None:
+    """Tell kassen how the sync is going, so its Synkroniser button is locked
+    for everyone while the robot runs and users see when it has finished.
+    status: "koerer" at the start (returns the run's id), then "faerdig" with
+    the counts from process(), or "fejlet" with besked=….
+
+    Never raises: the sync itself mustn't fail because kassen can't be told."""
+    try:
+        cred = orchestrator_connection.get_credential("BrugAarhusKassenAPI")
+        resp = requests.post(
+            f"{cred.username.rstrip('/')}/udeservering/api/synkronisering/robot",
+            json={"status": status, "id": sync_id, **detaljer},
+            headers={"X-API-Key": cred.password},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            orchestrator_connection.log_error(
+                f"Kassen refused sync status '{status}' ({resp.status_code}): {resp.text[:300]}"
+            )
+            return sync_id
+        return resp.json().get("id") or sync_id
+    # pylint: disable-next = broad-exception-caught
+    except Exception as exc:
+        orchestrator_connection.log_error(f"Could not tell kassen sync status '{status}': {exc}")
+        return sync_id
 
 
 # =============================================================================

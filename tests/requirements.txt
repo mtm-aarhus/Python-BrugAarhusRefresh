@@ -1,0 +1,3 @@
+# What the tests need. They test the pure parts (robot_framework/aendringer.py)
+# without OpenOrchestrator, Deskpro or a database, so nothing yet.
+# Installed into tests/.venv by tests/opsaet_testmiljoe.py.

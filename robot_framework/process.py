@@ -17,6 +17,8 @@ import pyodbc
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
+from robot_framework.aendringer import KOLONNER, Aendringer
+
 
 # =============================================================================
 # DESKPRO FIELD IDS
@@ -85,8 +87,9 @@ WINTER_OPT_TO_NAME = {
 # PROCESS
 # =============================================================================
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> dict:
-    """Sync and return the counts that kassen shows for the run:
-    {"tilladelser", "dannet", "opdateret", "slettet"}."""
+    """Sync and return what kassen shows for the run: "tilladelser" (synced),
+    "dannet" / "opdateret" / "slettet" (fakturalinjer) and "nye" / "aendrede"
+    with their lists (see aendringer.py)."""
     orchestrator_connection.log_trace("Running process.")
 
     brugaarhus_api_cred = orchestrator_connection.get_credential("BrugAarhusAPI")
@@ -146,20 +149,35 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 
     # -------------------------------
     # Upsert every tilladelse. New rows get KassenStatus "Afventer" from the
-    # column default; kassen's own approval is never overwritten here.
+    # column default; kassen's own approval is never overwritten here. What
+    # actually changed is noted for kassen's "synkronisering færdig" message.
     # -------------------------------
+    aendringer = Aendringer(eksisterende_tilladelser(cursor))
     for ticket in all_data:
-        cursor.execute(MERGE_SQL, tilladelse_params(ticket))
+        params = tilladelse_params(ticket)
+        aendringer.noter(params)
+        cursor.execute(MERGE_SQL, params)
     conn.commit()
     cursor.close()
     conn.close()
-    orchestrator_connection.log_info(f"Synced {len(all_data)} tilladelser from Deskpro.")
+    orchestrator_connection.log_info(
+        f"Synced {len(all_data)} tilladelser from Deskpro: "
+        f"{len(aendringer.nye)} new, {len(aendringer.aendrede)} changed."
+    )
 
     # -------------------------------
     # Fakturalinjer: kassen's job. Committed above, so kassen sees the data.
     # -------------------------------
     linjer = opdater_fakturalinjer_i_kassen(orchestrator_connection, [t["id"] for t in all_data])
-    return {**linjer, "tilladelser": len(all_data)}
+    return {**linjer, "tilladelser": len(all_data), **aendringer.til_kassen()}
+
+
+def eksisterende_tilladelser(cursor) -> dict[int, dict]:
+    """Every tilladelse already in kassen, as the MERGE columns — to tell
+    new and changed ones apart."""
+    cursor.execute(f"SELECT {', '.join(KOLONNER)} FROM dbo.BrugAarhus_Udeservering")
+    navne = [c[0] for c in cursor.description]
+    return {int(r[0]): dict(zip(navne, r)) for r in cursor.fetchall()}
 
 
 MERGE_SQL = """

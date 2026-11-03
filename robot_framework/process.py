@@ -33,7 +33,9 @@ FIELD_WORKFLOW = "1147"            # Workflow (sagsstatus)
 FIELD_ZONE = "1216"                # Zone (1 / 2)
 FIELD_UDESERVERINGSTYPE = "1192"   # Alm. udeservering / Parklet / Specialtilladelse
 FIELD_SERVERINGSAREAL = "1196"     # m2 — all types
-FIELD_FACADELAENGDE = "1210"       # the form shows it for Alm. udeservering
+# The form shows it for Alm. udeservering. A number field that replaces 1210,
+# which can't hold 0 (its values were copied over by kopier_facade_1370.py).
+FIELD_FACADELAENGDE = "1370"
 
 # Periode — shared by all types, both set by the sagsbehandler. A slutdato
 # works like an opsigelse; no slutdato = fortløbende.
@@ -46,8 +48,9 @@ FIELD_SLUTDATO = "1292"
 FIELD_SOMMERSAESON = "64"          # Radio: Ja (65) / Nej (66)
 FIELD_VINTERSAESON = "67"          # Checkbox multi: the winter months
 
-# Deskpro department of the udeservering form ("TEST - Udeservering").
-DEPARTMENT_ID = 23
+# Deskpro department of the udeservering form — the one the old tickets were
+# migrated into (udeservering_form_setup.md in the migration repo).
+DEPARTMENT_ID = 1
 
 # How many tilladelser per call to kassen's fakturalinje API (max 500).
 KASSEN_CHUNK = 100
@@ -105,7 +108,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     conn_string = (
         "DRIVER={SQL Server};"
         f"SERVER={sql_server.value};"
-        "DATABASE=PYORCHESTRATOR;"
+        "DATABASE=BrugAarhusKassen;"
         "Trusted_Connection=yes;"
     )
     conn = pyodbc.connect(conn_string)

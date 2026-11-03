@@ -2,141 +2,48 @@
 
 ## Overview
 
-This process is an automated robot that synchronizes invoice-related data from the Deskpro API into two SQL Server tables used by the BrugAarhus invoicing system (“BrugAarhusKassen”).
+This robot syncs udeservering tilladelser from Deskpro into BrugAarhus Kassen's database (`BrugAarhusKassen`, table `dbo.BrugAarhus_Udeservering`) — nothing else. The fakturalinjer are kassen's job: after the sync the robot asks kassen to bring the lines of the synced tilladelser up to date.
 
-The robot is triggered inside **OpenOrchestrator**, fetches all Deskpro tickets that have been marked as ready for invoicing (`ticket_field.1228 = 1229`), updates local application rows, and generates any missing invoice lines.
-
-Its purpose is to ensure that BrugAarhus’ invoicing foundation is always fresh, consistent, and complete – even when tickets are edited or backfilled in Deskpro.
+It runs from the Synkroniser button in kassen (or on a schedule) and tells kassen when it starts and how it ended, so the button is locked meanwhile.
 
 ---
 
-## High-Level Workflow
+## What it does
 
-1. **Authenticate to Deskpro API**
+1. **Fetch** every ticket in Deskpro department `1` with Workflow (`1147`) = "Ansøgning godkendt" (`1151`), one query per ticket status, skipping the `hidden.*` ones. Tilladelser already in kassen that still matter but are no longer godkendt are fetched one by one — once in kassen a tilladelse stays, and kassen warns about the changed status.
+2. **Upsert** each ticket into `dbo.BrugAarhus_Udeservering` (MERGE on the ticket id). New rows get KassenStatus "Afventer" from the column default; kassen's own approval is never overwritten.
+3. **Fakturalinjer** via kassen's `POST /udeservering/api/fakturalinjer/dan`, 100 tilladelser per call.
+4. **Report** what changed (`robot_framework/aendringer.py`) to kassen's `POST /udeservering/api/synkronisering/robot`.
 
-   * The robot reads a stored credential named `BrugAarhusAPI` from Orchestrator.
-   * The credential exposes:
+OpenOrchestrator setup:
 
-     * `username` → API base URL
-     * `password` → API token
-   * Calls the Deskpro endpoint:
-
-     ```
-     /api/v2/tickets?ticket_field.1228=1229&count=10
-     ```
-
-     and automatically iterates through *all pages*.
-
-2. **SQL Server Connection**
-
-   * Establishes a trusted connection to the SQL Server using the Orchestrator constant `SqlServer`.
-   * Works against the database `PYORCHESTRATOR`.
-
-3. **Fetch and Process All Relevant Tickets**
-   For each ticket returned from Deskpro:
-
-   * Extracts all relevant fields (company name, address, CVR, serving zone, geo, location type, serving area, façade length, selected months, etc.).
-   * Converts date fields to Copenhagen timezone.
-   * Safely parses Deskpro’s field structures using helper functions.
-
-4. **Upsert Application Records** (Ansøgninger)
-   Each Deskpro ticket is merged into the SQL table:
-
-   ```
-   dbo.BrugAarhus_Udeservering
-   ```
-
-   The MERGE statement ensures:
-
-   * Existing rows are updated.
-   * New rows are inserted.
-   * No duplicates are created.
-
-5. **Generate Missing Invoice Lines**
-   After all application rows have been updated, the robot:
-
-   * Reads **all** applications from `BrugAarhus_Udeservering`.
-   * Parses the month lists for:
-
-     * `MaanederIndevaerende` (current year)
-     * `MaanederFremtidige` (next year)
-   * Determines invoice months and their correct year.
-   * Inserts invoice lines into:
-
-     ```
-     dbo.BrugAarhus_Udeservering_Fakturalinjer
-     ```
-
-     but **only if they do not already exist**.
-
-   Each generated invoicing line contains:
-
-   * Deskpro ticket ID
-   * Invoice month + year
-   * Sortable date (`FakturaDatoSort`)
-   * Company and application details
-   * Application date
-   * Default `FakturaStatus = 'Ny'`
-
-6. **Logging and Completion**
-
-   * Logs informational messages and counts:
-
-     * Inserted invoice lines
-     * Skipped due to existing rows
-     * Skipped due to invalid month JSON
-   * Commits all SQL transactions.
+* Credential `BrugAarhusAPI` — username = Deskpro base URL, password = API token
+* Credential `BrugAarhusKassenAPI` — username = kassen's base URL, password = the robot API key
+* Constant `SqlServer` — trusted connection, so the robot's Windows account needs read/write in `BrugAarhusKassen`
 
 ---
 
-## Field Mapping Summary
+## Field mapping
 
-The robot extracts a variety of Deskpro custom fields, including (examples):
+Always by id — Deskpro titles get renamed.
 
-* `55` → Firmanavn
-* `255` → Adresse
-* `1258` → CVR
-* `268` → Geo
-* `1216` → Serveringszone (detailed title)
-* `1192` → Lokation (single select)
-* `1196` → Serveringsareal
-* `1210` → Facadelaengde
-* `1272` → Periodetype
-* `1197` → MaanederFremtidige (month multi-select)
-* `1259` → MaanederIndevaerende (month multi-select)
+| Deskpro field | Column |
+|---|---|
+| `55` Restaurationens / virksomhedens navn | Firmanavn |
+| `255` Restaurationens / virksomhedens adresse | Adresse |
+| `1258` CVR | CVR |
+| `1216` Zone (`1217` = 1, `1220` = 2) | Serveringszone |
+| `1192` Udeserveringstype (`1193` Alm., `1195` Parklet, `1194` Specialtilladelse) | Udeserveringstype, UdeserveringstypeOptionId |
+| `1196` Areal m² | Serveringsareal |
+| `1370` Facadelængde (replaces `1210`, which can't hold 0) | Facadelaengde |
+| `1291` / `1292` Startdato / Slutdato | GaeldendeFra / GaeldendeTilOgMed |
+| `64` Sommersæson (`65` Ja, `66` Nej) | Sommersaeson ("Ja" / "Nej") |
+| `67` Vintersæson (`68` Oktober … `73` Marts) | Vintermaaneder ("Oktober, November") |
+| `1147` Workflow | Workflow, WorkflowOptionId |
+| ticket person | Att |
+| ticket created | Ansogningsdato |
 
----
-
-## What the Robot Guarantees
-
-✔ BrugAarhus_Udeservering always reflects the newest Deskpro ticket data
-✔ Missing invoice lines are auto-generated for all relevant months
-✔ No duplicate invoice lines will ever be created
-✔ Deskpro pagination is fully handled
-✔ Timezones are correctly converted to Europe/Copenhagen
-
----
-
-## Known Limitations / Assumptions
-
-* Deskpro field structures must remain consistent with the ones used today.
-* Month lists must be valid JSON lists of titles; invalid JSON month lists are skipped.
-* The robot does **not** delete or modify existing invoice lines—only inserts missing ones.
-* Only tickets with the specified deskpro field (`ticket_field.1228=1229`) are processed.
-* All SQL operations assume the structure of BrugAarhus tables is unchanged.
-
----
-
-## Helper Functions
-
-The script includes multiple safety-oriented helper functions:
-
-* `safe_get()` – safely extract nested values
-* `safe_get_detail_title()` – extract `.detail` titles from Deskpro fields
-* `extract_single_select_title()` – extract selected title for single-select fields
-* `extract_month_list()` – convert multi-select detail maps into JSON arrays
-
-These ensure robust handling of Deskpro’s complex field payloads.
+Specialtilladelser get no season (they are never invoiced).
 
 ---
 

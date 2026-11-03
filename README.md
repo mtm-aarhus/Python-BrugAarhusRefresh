@@ -2,7 +2,7 @@
 
 ## Overview
 
-This robot syncs udeservering tilladelser from Deskpro into BrugAarhus Kassen's database (`BrugAarhusKassen`, table `dbo.BrugAarhus_Udeservering`) — nothing else. The fakturalinjer are kassen's job: after the sync the robot asks kassen to bring the lines of the synced tilladelser up to date.
+This robot syncs udeservering tilladelser from Deskpro into BrugAarhus Kassen's database (`BrugAarhusKassen`, table `dbo.BrugAarhus_Udeservering`) — nothing else. It makes no fakturalinjer: kassen calculates every month from the synced data, and the billing robot has kassen make the lines when it invoices.
 
 It runs from the Synkroniser button in kassen (or on a schedule) and tells kassen when it starts and how it ended, so the button is locked meanwhile.
 
@@ -12,8 +12,7 @@ It runs from the Synkroniser button in kassen (or on a schedule) and tells kasse
 
 1. **Fetch** every ticket in Deskpro department `1` with Workflow (`1147`) = "Ansøgning godkendt" (`1151`), one query per ticket status, skipping the `hidden.*` ones. Tilladelser already in kassen that still matter but are no longer godkendt are fetched one by one — once in kassen a tilladelse stays, and kassen warns about the changed status.
 2. **Upsert** each ticket into `dbo.BrugAarhus_Udeservering` (MERGE on the ticket id). New rows get KassenStatus "Afventer" from the column default; kassen's own approval is never overwritten.
-3. **Fakturalinjer** via kassen's `POST /udeservering/api/fakturalinjer/dan`, 100 tilladelser per call.
-4. **Report** what changed (`robot_framework/aendringer.py`) to kassen's `POST /udeservering/api/synkronisering/robot`.
+3. **Report** what changed (`robot_framework/aendringer.py`) to kassen's `POST /udeservering/api/synkronisering/robot`.
 
 OpenOrchestrator setup:
 

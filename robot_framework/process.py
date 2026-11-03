@@ -1,10 +1,9 @@
 """This module contains the main process of the robot.
 
 The robot syncs udeservering tilladelser from Deskpro into
-BrugAarhus_Udeservering — nothing else. The fakturalinjer are BrugAarhus
-Kassen's job: after the sync the robot asks kassen to bring the lines of the
-synced tilladelser up to date (POST /udeservering/api/fakturalinjer/dan), which
-keeps the rolling horizon moving and picks up changes from Deskpro.
+BrugAarhus_Udeservering — nothing else. It makes no fakturalinjer: kassen
+calculates every month from the synced data, and the billing robot has kassen
+make the lines when it invoices.
 
 linear_framework tells kassen when a run starts and how it ended
 (meld_synkronisering), so kassen can lock its Synkroniser button meanwhile.
@@ -52,9 +51,6 @@ FIELD_VINTERSAESON = "67"          # Checkbox multi: the winter months
 # migrated into (udeservering_form_setup.md in the migration repo).
 DEPARTMENT_ID = 1
 
-# How many tilladelser per call to kassen's fakturalinje API (max 500).
-KASSEN_CHUNK = 100
-
 
 # =============================================================================
 # OPTION IDS
@@ -90,9 +86,8 @@ WINTER_OPT_TO_NAME = {
 # PROCESS
 # =============================================================================
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> dict:
-    """Sync and return what kassen shows for the run: "tilladelser" (synced),
-    "dannet" / "opdateret" / "slettet" (fakturalinjer) and "nye" / "aendrede"
-    with their lists (see aendringer.py)."""
+    """Sync and return what kassen shows for the run: "tilladelser" (synced)
+    and "nye" / "aendrede" with their lists (see aendringer.py)."""
     orchestrator_connection.log_trace("Running process.")
 
     brugaarhus_api_cred = orchestrator_connection.get_credential("BrugAarhusAPI")
@@ -167,12 +162,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         f"Synced {len(all_data)} tilladelser from Deskpro: "
         f"{len(aendringer.nye)} new, {len(aendringer.aendrede)} changed."
     )
-
-    # -------------------------------
-    # Fakturalinjer: kassen's job. Committed above, so kassen sees the data.
-    # -------------------------------
-    linjer = opdater_fakturalinjer_i_kassen(orchestrator_connection, [t["id"] for t in all_data])
-    return {**linjer, "tilladelser": len(all_data), **aendringer.til_kassen()}
+    return {"tilladelser": len(all_data), **aendringer.til_kassen()}
 
 
 def eksisterende_tilladelser(cursor) -> dict[int, dict]:
@@ -288,50 +278,6 @@ def tilladelse_params(ticket: dict) -> tuple:
 # =============================================================================
 # KASSEN
 # =============================================================================
-def opdater_fakturalinjer_i_kassen(orchestrator_connection, ids: list[int]) -> dict:
-    """Ask BrugAarhus Kassen to bring the fakturalinjer of these tilladelser up
-    to date. Credential BrugAarhusKassenAPI: username = kassen's base URL,
-    password = the API key (BRUGAARHUS_ROBOT_API_KEY on the IIS site).
-    Returns kassen's totals: {"dannet", "opdateret", "slettet"}.
-
-    A failure is logged, not raised: the Deskpro data is already saved, and the
-    lines are brought up to date by kassen itself, or on the next run."""
-    totals = {"tilladelser": 0, "dannet": 0, "opdateret": 0, "slettet": 0}
-    if not ids:
-        return {k: v for k, v in totals.items() if k != "tilladelser"}
-    cred = orchestrator_connection.get_credential("BrugAarhusKassenAPI")
-    url = f"{cred.username.rstrip('/')}/udeservering/api/fakturalinjer/dan"
-    headers = {"X-API-Key": cred.password}
-
-    failed = 0
-    ids = sorted(set(ids))
-    for i in range(0, len(ids), KASSEN_CHUNK):
-        chunk = ids[i:i + KASSEN_CHUNK]
-        try:
-            resp = requests.post(url, json={"ids": chunk}, headers=headers, timeout=120)
-        except requests.RequestException as exc:
-            failed += len(chunk)
-            orchestrator_connection.log_error(f"Kassen unreachable for fakturalinjer: {exc}")
-            continue
-        if resp.status_code != 200:
-            failed += len(chunk)
-            orchestrator_connection.log_error(
-                f"Kassen refused fakturalinjer ({resp.status_code}): {resp.text[:300]}"
-            )
-            continue
-        body = resp.json()
-        for key in totals:
-            totals[key] += int(body.get(key) or 0)
-
-    orchestrator_connection.log_info(
-        "Fakturalinjer via kassen: "
-        f"{totals['tilladelser']} tilladelser, {totals['dannet']} created, "
-        f"{totals['opdateret']} updated, {totals['slettet']} deleted"
-        + (f", {failed} tilladelser NOT updated (see errors)" if failed else "")
-    )
-    return {k: v for k, v in totals.items() if k != "tilladelser"}
-
-
 def meld_synkronisering(orchestrator_connection, status: str, sync_id: int | None = None,
                         **detaljer) -> int | None:
     """Tell kassen how the sync is going, so its Synkroniser button is locked
@@ -429,17 +375,18 @@ def fetch_ticket(orchestrator_connection, base_url: str, headers: dict, ticket_i
 
 def kassen_ids_to_follow(cursor) -> list[int]:
     """Tilladelser already in kassen that still matter: active (no slutdato,
-    or one in this month or later) or with Ny lines not yet approved. Ended
-    tilladelser with only locked lines have nothing left to update."""
+    or one last month or later — the next billing run still invoices last
+    month) or with lines waiting for the billing robot. Ended tilladelser with
+    every month invoiced have nothing left to update."""
     cursor.execute(
         """
         SELECT u.Id
         FROM dbo.BrugAarhus_Udeservering u
         WHERE u.GaeldendeTilOgMed IS NULL
-           OR u.GaeldendeTilOgMed >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+           OR u.GaeldendeTilOgMed >= DATEADD(month, -1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
            OR EXISTS (
                 SELECT 1 FROM dbo.BrugAarhus_Udeservering_Fakturalinjer f
-                WHERE f.DeskproID = u.Id AND f.FakturaStatus = 'Ny'
+                WHERE f.DeskproID = u.Id AND f.FakturaStatus = 'TilFakturering'
            );
         """
     )
